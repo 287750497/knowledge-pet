@@ -524,7 +524,7 @@ pub fn run() {
                         let app = tray.app_handle();
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.unminimize(); let _ = w.show(); let _ = w.set_focus();
-                            use tauri::Emitter; let _ = Emitter::emit(app, "switch-view", "panel");
+                            use tauri::Emitter; let _ = Emitter::emit_to(app, "main", "switch-view", "panel");
                         }
                     }
                 })
@@ -532,21 +532,22 @@ pub fn run() {
                     "show" => {
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.unminimize(); let _ = w.show(); let _ = w.set_focus();
-                            use tauri::Emitter; let _ = Emitter::emit(app, "switch-view", "panel");
+                            use tauri::Emitter; let _ = Emitter::emit_to(app, "main", "switch-view", "panel");
                         }
                     }
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
-            // main 窗口点关闭 = 隐藏（托盘常驻），不退出
+            // main / pet 窗口点关闭 = 退出进程
             let handle = app.handle().clone();
-            app.get_webview_window("main").unwrap().on_window_event(move |ev| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = ev {
-                    api.prevent_close();
-                    if let Some(w) = handle.get_webview_window("main") { let _ = w.hide(); }
-                }
-            });
+            if let Some(w) = app.get_webview_window("main") {
+                w.on_window_event(move |ev| {
+                    if let tauri::WindowEvent::CloseRequested { .. } = ev {
+                        handle.exit(0);
+                    }
+                });
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

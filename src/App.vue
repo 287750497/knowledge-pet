@@ -146,7 +146,30 @@ const statusText: Record<string, string> = {
 onMounted(async () => {
   // 按窗口分流：pet 窗口显示桌宠，main 窗口显示面板
   const { listen } = await import("@tauri-apps/api/event");
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const cur = getCurrentWindow();
+    if (cur.label !== "pet") {
+      // 面板最小化 → 显示桌宠
+      const unR = await cur.onResized(({ payload: size }) => {
+        import("@tauri-apps/api/window").then(async ({ Window }) => {
+          // Tauri2: 最小化时逻辑尺寸为 0 或物理宽高为 0
+          if (size.width === 0 || size.height === 0) {
+            view.value = "pet";
+            const pet = await Window.getByLabel("pet");
+            if (pet) { await pet.show(); await pet.setFocus(); }
+          }
+        });
+      });
+      onUnmounted(() => unR());
+    }
+  } catch {}
+  const winLabel = await (async () => {
+    try { const { getCurrentWindow } = await import("@tauri-apps/api/window"); return getCurrentWindow().label; }
+    catch { return "main"; }
+  })();
   const un = await listen<string>("switch-view", (e) => {
+    if (winLabel !== "main") return; // 只有面板窗响应切换，桌宠视图永不被动改
     const v = e.payload;
     if (v === "panel" || v === "settings" || v === "pet") view.value = v as any;
   });
@@ -176,6 +199,20 @@ onMounted(async () => {
   onUnmounted(() => un2());
 });
 
+// 回到桌宠：显示 pet 窗、隐藏/最小化 main
+async function backToPet() {
+  try {
+    const { getCurrentWindow, Window } = await import("@tauri-apps/api/window");
+    const cur = getCurrentWindow();
+    view.value = "pet";
+    const pet = await Window.getByLabel("pet");
+    if (pet) { await pet.show(); await pet.setFocus(); }
+    if (cur.label !== "pet") {
+      await cur.hide();          // 面板隐藏（托盘/双击桌宠可再唤起）
+    }
+  } catch { view.value = "pet"; }
+}
+
 // pet 窗口切到面板时，显示 main 窗口、隐藏自己
 async function openPanel() {
   try {
@@ -186,8 +223,8 @@ async function openPanel() {
       const main = await Window.getByLabel("main");
       if (main) { await main.show(); await main.setFocus();
         // main 窗之前被「回到桌宠」切到 pet 视图，重新拉起时让它回到面板
-        const { emit } = await import("@tauri-apps/api/event");
-        await emit("switch-view", "panel").catch(() => {});
+        const { emitTo } = await import("@tauri-apps/api/event");
+        await emitTo("main", "switch-view", "panel").catch(() => {});
       }
       await cur.hide();
       return;
@@ -215,7 +252,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
   <!-- 管理面板 -->
   <div v-else-if="view === 'panel'" class="panel">
     <header>
-      <button class="mini" @click="view = 'pet'">🐱 回到桌宠</button>
+      <button class="mini" @click="backToPet">🐱 回到桌宠</button>
       <h2>📚 知识收藏面板</h2>
       <button class="mini" @click="view = 'settings'">⚙ 设置</button>
     </header>
@@ -311,7 +348,8 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
 
 <style>
 * { box-sizing: border-box; margin: 0; }
-body { font-family: system-ui, "Microsoft YaHei"; background: transparent; overflow: hidden; }
+html, body { background: transparent !important; }
+body { font-family: system-ui, "Microsoft YaHei"; overflow: hidden; }
 
 /* 桌宠 */
 .petwrap { width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; }
