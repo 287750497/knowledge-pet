@@ -1,0 +1,51 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "knowledge-pet",
+  "version": "0.1.0",
+  "identifier": "com.knowledgepet.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5190",
+    "beforeDevCommand": "npm run dev -- --port 5190",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "pet",
+        "title": "KnowledgePet",
+        "width": 120,
+        "height": 110,
+        "x": 1140,
+        "y": 600,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false
+      },
+      {
+        "label": "main",
+        "title": "知识收藏面板",
+        "width": 760,
+        "height": 560,
+        "visible": false,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

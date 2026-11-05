@@ -1,0 +1,48 @@
+Knowledge Pet（知识收藏桌宠）v0.1 - Windows 使用说明
+=====================================================
+
+一、这是什么
+电脑右下角常驻一只猫咪桌宠：
+- 单击猫咪：把剪贴板内容收进知识库（自动判断网址/文本），嘴角冒泡提示「收到」
+- 双击猫咪：打开知识收藏面板（统计/筛选/抓取/AI整理/设置）
+- 网址收藏后进入抓取队列，自动爬取正文
+- 点「AI 整理成卡」：调用你配置的 API，把素材整理成带「一句话结论/展开/下一步行动」的知识卡，存进 30-notes
+- 状态流转：🌱新收 → 📄已爬正文 → 👁已读 → ✨已成卡
+- 关闭面板窗口只是隐藏，从托盘图标右键可退出/唤起
+
+二、首次运行（源码方式）
+1. 解压 knowledge-pet-src.zip
+2. 需要先装环境：
+   - Node.js 18+（https://nodejs.cn）
+   - Rust（https://rustup.rs，装 MSVC toolchain + Visual Studio Build Tools）
+3. 双击「安装依赖.bat」或手动：
+   cd knowledge-pet
+   npm install --registry=https://registry.npmmirror.com
+4. 开发模式运行（先跑通）：
+   npm run tauri dev
+5. 正式打包成 exe：
+   npm run tauri build
+   产物在 src-tauri/target/release/knowledge-pet.exe
+
+三、配置 API（重要，AI 整理功能依赖）
+1. 双击猫咪打开面板 → 右上角「⚙ 设置」
+2. 填三项：
+   - API 地址：OpenAI 兼容接口，如 https://apihub.agnes-ai.com/v1
+   - API Key：你的 key
+   - 模型名：如 agnes-3.0-flash（或 gpt-4o-mini 等）
+3. 点「💾 保存」。配置存在知识库目录 .pet-config.json，不打包不上传
+4. 可点「🧪 测试连接」验证
+
+四、知识库位置
+默认在 C:\Users\你的用户名\knowledge-base\
+- 10-inbox  收件箱（桌宠收集的内容）
+- 30-notes  知识卡
+- 建议用 git 管理：git init && git add -A && git commit -m init
+
+五、常见问题
+- 猫咪点了没反应：确认剪贴板里有内容（先 Ctrl+C 复制一段文字或网址）
+- AI 整理报错：先去设置页检查 API 三项是否填好，点测试连接
+- 抓正文失败：部分网站（微信/知乎）有反爬，会标记❌抓取失败，正文可手动粘贴补充
+- 双击面板没出来：看任务栏托盘有没有猫咪图标，右键→打开管理面板
+
+实测记录（Linux 无头环境已验证）：单击收集→冒泡→入 inbox✓；URL 判断+自动抓正文✓；设置页保存读取✓；AI 真实调用生成知识卡✓；标记已读✓。托盘菜单和全局热键请在 Windows 上实测。
