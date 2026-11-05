@@ -26,3 +26,5 @@ tauri-plugin-log = "2"
 tokio = { version = "1.54.1", features = ["process", "time", "macros"] }
 tauri-plugin-clipboard-manager = "2.5.0"
 reqwest = { version = "0.13.5", features = ["json"] }
+tauri-plugin-global-shortcut = "2.4.1"
+tauri-plugin-shell = "2.6.0"

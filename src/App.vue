@@ -4,13 +4,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 
 interface Item { id: string; file: string; title: string; kind: string; url: string; status: string; created_at: string; error: string }
-interface AiConfig { base_url: string; api_key: string; model: string }
+interface AiConfig { base_url: string; api_key: string; model: string; hotkey: string; kb_dir_override: string }
+interface Bookmark { title: string; url: string }
 interface Stats { total: number; seed: number; fetched: number; "fetch-failed": number; read: number; carded: number; queue: number; notes: number }
 
 const view = ref<"pet" | "panel" | "settings">("pet");
 const items = ref<Item[]>([]);
 const st = ref<Stats | null>(null);
-const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "" });
+const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+Alt+C", kb_dir_override: "" });
+const bookmarks = ref<Bookmark[]>([]);
+const bmNew = ref({ title: "", url: "" });
+const kbNew = ref("");
 const bubble = ref("");
 const bubbleShow = ref(false);
 const busy = ref<Record<string, boolean>>({});
@@ -30,7 +34,9 @@ async function refresh() {
 // 桌宠单击：收剪贴板
 async function petClick() {
   try {
-    const text = await readText();
+    let text = "";
+    try { text = await readText(); } catch { text = ""; }
+    if (!text || !text.trim()) { showBubble("⚠️ 剪贴板是空的，先复制点东西"); return; }
     const it = await invoke<Item>("capture", { text });
     showBubble(it.kind === "url" ? "📥 收到网址，排队抓取" : "📥 收到，已放进收件箱");
     refresh();
@@ -71,6 +77,38 @@ async function makeCard(it: Item) {
 
 async function markRead(it: Item) {
   await invoke("mark_read", { id: it.id });
+  refresh();
+}
+
+async function delItem(it: Item) {
+  try { showBubble("🗑 " + await invoke<string>("delete_item", { id: it.id })); }
+  catch (e) { showBubble("⚠️ " + String(e)); }
+  refresh();
+}
+
+async function loadBookmarks() {
+  bookmarks.value = await invoke<Bookmark[]>("list_bookmarks");
+}
+
+async function addBm() {
+  try {
+    await invoke("add_bookmark", { title: bmNew.value.title, url: bmNew.value.url });
+    bmNew.value = { title: "", url: "" };
+    showBubble("✓ 已加入常用网址");
+    loadBookmarks();
+  } catch (e) { showBubble("⚠️ " + String(e).replace(/^.*：/, "")); }
+}
+
+async function delBm(url: string) {
+  await invoke("remove_bookmark", { url });
+  loadBookmarks();
+}
+
+async function moveKb() {
+  if (!kbNew.value.trim()) { showBubble("⚠️ 先填新目录路径"); return; }
+  showBubble("🚚 迁移中…");
+  try { showBubble("✓ " + await invoke<string>("move_kb_dir", { newDir: kbNew.value })); }
+  catch (e) { showBubble("⚠️ " + String(e)); }
   refresh();
 }
 
@@ -120,7 +158,22 @@ onMounted(async () => {
   } catch { view.value = "panel"; }
   cfg.value = await invoke<AiConfig>("get_config");
   refresh();
+  loadBookmarks();
   pollTimer = window.setInterval(refresh, 5000);
+  // 全局热键触发主动抓取（在 pet 窗口执行收集）
+  const un2 = await listen("hotkey-capture", async () => {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    if (getCurrentWindow().label !== "pet") return;
+    try {
+      let text = "";
+      try { text = await readText(); } catch { text = ""; }
+      if (!text || !text.trim()) { showBubble("⚠️ 剪贴板是空的"); return; }
+      const it = await invoke<Item>("capture", { text });
+      showBubble(it.kind === "url" ? "📥 收到网址，排队抓取" : "📥 收到，已放进收件箱");
+      refresh();
+    } catch (e) { showBubble("⚠️ " + String(e).replace(/^.*：/, "")); }
+  });
+  onUnmounted(() => un2());
 });
 
 // pet 窗口切到面板时，显示 main 窗口、隐藏自己
@@ -197,9 +250,24 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
           <button v-if="it.status === 'seed' && it.kind === 'url'" class="mini" @click="crawlAll">🕷 抓正文</button>
           <button class="mini ok" :disabled="busy[it.id]" @click="makeCard(it)">✨ AI 整理成卡</button>
           <button v-if="it.status !== 'read' && it.status !== 'carded'" class="mini" @click="markRead(it)">👁 标记已读</button>
+          <button class="mini danger" @click="delItem(it)">🗑 删除</button>
         </div>
       </div>
       <p v-if="!shown.length" class="empty">空空如也。去别的窗口复制点东西，然后点一下桌宠 🐱</p>
+    </div>
+
+    <h3 class="bmtitle">⭐ 常用网址</h3>
+    <div class="bmform">
+      <input v-model="bmNew.title" placeholder="名称（可空）" class="bm-title" />
+      <input v-model="bmNew.url" placeholder="https://…  网址" class="bm-url" @keyup.enter="addBm" />
+      <button class="mini ok" @click="addBm">＋ 添加</button>
+    </div>
+    <div class="bmgrid">
+      <div v-for="b in bookmarks" :key="b.url" class="bmitem">
+        <a :href="b.url" target="_blank" class="bmlink">{{ b.title }}</a>
+        <button class="mini danger" @click="delBm(b.url)">✕</button>
+      </div>
+      <p v-if="!bookmarks.length" class="empty2">还没有常用网址</p>
     </div>
   </div>
 
@@ -207,9 +275,10 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
   <div v-else class="panel settings">
     <header>
       <button class="mini" @click="view = 'panel'">← 返回</button>
-      <h2>⚙ 设置 · API 模型</h2>
+      <h2>⚙ 设置</h2>
     </header>
     <form @submit.prevent="saveConfig" class="cfgform">
+      <h3 class="sect">🤖 API 模型</h3>
       <label>API 地址（base_url）</label>
       <input v-model="cfg.base_url" placeholder="https://api.example.com/v1" />
       <label>API Key</label>
@@ -221,6 +290,21 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
         <button type="submit" class="ok">💾 保存</button>
         <button type="button" class="mini" @click="testConfig">🧪 测试连接（用最新一条做真实整理）</button>
       </div>
+
+      <h3 class="sect">⌨️ 主动抓取热键</h3>
+      <label>全局热键（任意窗口按下即收剪贴板）</label>
+      <input v-model="cfg.hotkey" placeholder="Ctrl+Alt+C" />
+      <p class="tip">格式：Ctrl/Shift/Alt/Super 组合 + 字母/数字，如 Ctrl+Alt+C、Ctrl+Shift+K。改完点保存生效（下次启动也生效）。</p>
+
+      <h3 class="sect">📁 知识库目录</h3>
+      <label>当前目录</label>
+      <input :value="cfg.kb_dir_override || '默认（用户目录/knowledge-pet）'" disabled />
+      <label>迁移到新目录</label>
+      <input v-model="kbNew" placeholder="D:\知识库\knowledge-pet" />
+      <div class="btns">
+        <button type="button" class="mini" @click="moveKb">🚚 迁移（自动搬 inbox/知识卡/常用网址）</button>
+      </div>
+      <p class="tip">首次启动会自动在用户目录创建 knowledge-pet（含 10-inbox/20-sources/30-notes/40-sop/90-archive）。迁移会把内容整体搬到新目录。</p>
     </form>
   </div>
 </template>
@@ -267,8 +351,26 @@ h2 { font-size: 18px; flex: 1; }
 .mini:disabled { opacity: .4; cursor: default; }
 .empty { text-align: center; color: #999; padding: 40px 0; font-size: 13px; }
 
+/* 删除按钮 */
+.mini.danger { background: #fee2e2; color: #b91c1c; }
+/* 常用网址 */
+.bmtitle { font-size: 15px; margin: 18px 0 8px; }
+.bmform { display: flex; gap: 6px; margin-bottom: 10px; }
+.bmform .bm-title { width: 160px; }
+.bmform .bm-url { flex: 1; }
+.bmform input { padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; }
+.bmgrid { display: flex; flex-wrap: wrap; gap: 8px; }
+.bmitem { display: flex; align-items: center; gap: 6px; background: #fff; border: 1px solid #e5e0d8; border-radius: 999px; padding: 6px 12px; }
+.bmlink { font-size: 13px; color: #2563eb; text-decoration: none; }
+.bmlink:hover { text-decoration: underline; }
+.bmitem .mini.danger { padding: 2px 8px; border-radius: 999px; }
+.empty2 { font-size: 12px; color: #999; }
+/* 设置分节 */
+.sect { font-size: 15px; margin: 18px 0 4px; border-top: 1px dashed #e5e0d8; padding-top: 14px; }
+form > .sect:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
+
 /* 设置 */
-.cfgform { max-width: 420px; display: flex; flex-direction: column; }
+.cfgform { max-width: 480px; display: flex; flex-direction: column; }
 .cfgform label { font-size: 13px; color: #555; margin: 10px 0 4px; }
 .cfgform input { padding: 9px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; }
 .tip { font-size: 12px; color: #999; margin: 12px 0; }

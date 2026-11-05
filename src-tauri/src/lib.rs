@@ -18,15 +18,41 @@ pub struct Item {
     pub error: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,          // 主动抓取热键，默认 Ctrl+Alt+C
+    #[serde(default)]
+    pub kb_dir_override: String, // 知识库目录（空=默认 ~/knowledge-base）
+}
+
+fn default_hotkey() -> String { "Ctrl+Alt+C".into() }
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        AiConfig { base_url: String::new(), api_key: String::new(), model: String::new(), hotkey: default_hotkey(), kb_dir_override: String::new() }
+    }
+}
+
+// 常用网址收藏
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Bookmark { pub title: String, pub url: String }
+
+fn load_bookmarks(kb: &PathBuf) -> Vec<Bookmark> {
+    fs::read_to_string(kb.join(".pet-bookmarks.json")).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_bookmarks(kb: &PathBuf, b: &[Bookmark]) {
+    let _ = fs::write(kb.join(".pet-bookmarks.json"), serde_json::to_string_pretty(b).unwrap());
 }
 
 pub struct PetState {
-    pub kb_dir: PathBuf,
+    pub kb_dir: Mutex<PathBuf>,   // 可迁移，加锁
     pub config: Mutex<AiConfig>,
     pub queue: Mutex<Vec<String>>, // 待爬 URL 队列（id）
 }
@@ -113,7 +139,8 @@ fn set_fm_field(path: &PathBuf, key: &str, val: &str) {
 // 扫描 10-inbox 全部条目
 #[tauri::command]
 fn list_items(state: State<PetState>) -> Vec<Item> {
-    scan_items(&state.kb_dir)
+    let kb = state.kb_dir.lock().unwrap().clone();
+    scan_items(&kb)
 }
 
 fn scan_items(kb: &PathBuf) -> Vec<Item> {
@@ -151,8 +178,9 @@ fn scan_items(kb: &PathBuf) -> Vec<Item> {
 fn capture(state: State<PetState>, text: String) -> Result<Item, String> {
     let text = text.trim().to_string();
     if text.is_empty() { return Err("剪贴板是空的".into()); }
+    let kb = state.kb_dir.lock().unwrap().clone();
     let is_url = text.starts_with("http://") || text.starts_with("https://");
-    for it in scan_items(&state.kb_dir) {
+    for it in scan_items(&kb) {
         if (is_url && it.url == text) || (!is_url && it.title == text.lines().next().unwrap_or("")) {
             return Err(format!("已收过：{}", it.title));
         }
@@ -170,7 +198,7 @@ fn capture(state: State<PetState>, text: String) -> Result<Item, String> {
     } else {
         format!("---\nkind: text\nstatus: seed\ncreated: {}\n---\n\n# {}\n\n{}", chrono_today(), first, text)
     };
-    let full = state.kb_dir.join("10-inbox").join(&fname);
+    let full = kb.join("10-inbox").join(&fname);
     fs::create_dir_all(full.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&full, body).map_err(|e| e.to_string())?;
     if is_url { state.queue.lock().unwrap().push(id.clone()); }
@@ -191,11 +219,12 @@ fn capture(state: State<PetState>, text: String) -> Result<Item, String> {
 async fn process_queue(state: State<'_, PetState>) -> Result<String, String> {
     let id = state.queue.lock().unwrap().pop().ok_or("队列空")?;
     eprintln!("[pet] process_queue pop id={}", id);
-    let items = scan_items(&state.kb_dir);
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let items = scan_items(&kb);
     eprintln!("[pet] items: {:?}", items.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
     let it = items.iter().find(|i| i.id == id || i.id.starts_with(&id)).ok_or(format!("条目不存在：{}", id))?;
     let url = it.url.clone();
-    let path = state.kb_dir.join(&it.file);
+    let path = kb.join(&it.file);
     eprintln!("[pet] fetching url={:?} path={:?}", url, path);
     let resp = reqwest::get(&url).await.map_err(|e| {
         eprintln!("[pet] fetch error: {}", e);
@@ -253,9 +282,10 @@ fn extract_article(html: &str) -> (String, String) {
 async fn ai_make_card(state: State<'_, PetState>, id: String) -> Result<String, String> {
     let cfg = state.config.lock().unwrap().clone();
     if cfg.api_key.is_empty() || cfg.base_url.is_empty() { return Err("请先在设置里配置 API".into()); }
-    let items = scan_items(&state.kb_dir);
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let items = scan_items(&kb);
     let it = items.iter().find(|i| i.id == id).ok_or("条目不存在")?;
-    let text = fs::read_to_string(state.kb_dir.join(&it.file)).map_err(|e| e.to_string())?;
+    let text = fs::read_to_string(kb.join(&it.file)).map_err(|e| e.to_string())?;
     let prompt = format!(
         "你是知识库管理员。把下面的素材整理成一张知识卡。\n输出 frontmatter + 正文，格式严格如下（YAML）:\n---\ntitle: 卡片标题（10字内）\ntags: [标签1, 标签2]\nstatus: seed\nsource: \"{}\"\n---\n\n# 一句话结论\n\n（最核心的判断一句话）\n\n## 展开\n\n（要点、例子，markdown 列表，300字内）\n\n## 下一步行动\n\n- [ ] 一个可执行的下一步\n\n素材：\n{}",
         it.url, text
@@ -272,7 +302,7 @@ async fn ai_make_card(state: State<'_, PetState>, id: String) -> Result<String, 
     let content = j.pointer("/choices/0/message/content").and_then(|v| v.as_str())
         .ok_or_else(|| format!("AI 返回异常：{}", serde_json::to_string(&j).unwrap_or_default().chars().take(200).collect::<String>()))?
         .to_string();
-    let cards_dir = state.kb_dir.join("30-notes");
+    let cards_dir = kb.join("30-notes");
     fs::create_dir_all(&cards_dir).map_err(|e| e.to_string())?;
     // AI 有时会包 ```yaml 围栏 / 前置闲话——定位真正的 frontmatter 起点
     let body = match content.find("\n---\n").or_else(|| content.starts_with("---").then(|| 0)) {
@@ -282,15 +312,63 @@ async fn ai_make_card(state: State<'_, PetState>, id: String) -> Result<String, 
     let title = body.lines().find(|l| l.starts_with("title:")).map(|l| l[6..].trim().trim_matches('"').to_string()).unwrap_or_else(|| it.title.clone());
     let fname = format!("{}-{}.md", chrono_today(), sanitize(&title));
     fs::write(cards_dir.join(&fname), body.trim_start()).map_err(|e| e.to_string())?;
-    set_fm_field(&state.kb_dir.join(&it.file), "status", "carded");
+    set_fm_field(&kb.join(&it.file), "status", "carded");
     Ok(format!("知识卡已生成：{}", fname))
 }
 
 #[tauri::command]
 fn mark_read(state: State<PetState>, id: String) -> Result<(), String> {
-    let items = scan_items(&state.kb_dir);
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let items = scan_items(&kb);
     let it = items.iter().find(|i| i.id == id).ok_or("条目不存在")?;
-    set_fm_field(&state.kb_dir.join(&it.file), "status", "read");
+    set_fm_field(&kb.join(&it.file), "status", "read");
+    Ok(())
+}
+
+// 删除收藏条目（移到知识库 90-archive 下 .trash-<日期>/，可找回）
+#[tauri::command]
+fn delete_item(state: State<PetState>, id: String) -> Result<String, String> {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let items = scan_items(&kb);
+    let it = items.iter().find(|i| i.id == id).ok_or("条目不存在")?;
+    let trash = kb.join("90-archive").join(format!(".trash-{}", chrono_today()));
+    fs::create_dir_all(&trash).map_err(|e| e.to_string())?;
+    let fname = it.file.split('/').next_back().unwrap_or("unknown.md").to_string();
+    let dest = trash.join(&fname);
+    // 同名冲突加序号
+    let mut dest = dest.clone();
+    let mut n = 1;
+    while dest.exists() { n += 1; dest = trash.join(format!("{}.{}.md", fname.trim_end_matches(".md"), n)); }
+    fs::rename(kb.join(&it.file), &dest).map_err(|e| e.to_string())?;
+    Ok(format!("已删除：{}", it.title))
+}
+
+// ---- 常用网址 ----
+#[tauri::command]
+fn list_bookmarks(state: State<PetState>) -> Vec<Bookmark> {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    load_bookmarks(&kb)
+}
+
+#[tauri::command]
+fn add_bookmark(state: State<PetState>, title: String, url: String) -> Result<(), String> {
+    let url = url.trim().to_string();
+    if !url.starts_with("http://") && !url.starts_with("https://") { return Err("网址要以 http(s):// 开头".into()); }
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let mut b = load_bookmarks(&kb);
+    if b.iter().any(|x| x.url == url) { return Err("已在常用网址里".into()); }
+    let title = if title.trim().is_empty() { url.trim_start_matches("https://").trim_start_matches("http://").chars().take(30).collect() } else { title.trim().to_string() };
+    b.insert(0, Bookmark { title, url });
+    save_bookmarks(&kb, &b);
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_bookmark(state: State<PetState>, url: String) -> Result<(), String> {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let mut b = load_bookmarks(&kb);
+    b.retain(|x| x.url != url);
+    save_bookmarks(&kb, &b);
     Ok(())
 }
 
@@ -298,15 +376,64 @@ fn mark_read(state: State<PetState>, id: String) -> Result<(), String> {
 fn get_config(state: State<PetState>) -> AiConfig { state.config.lock().unwrap().clone() }
 
 #[tauri::command]
-fn set_config(state: State<PetState>, base_url: String, api_key: String, model: String) {
+fn set_config(state: State<PetState>, base_url: String, api_key: String, model: String, hotkey: Option<String>) {
     let mut c = state.config.lock().unwrap();
     c.base_url = base_url; c.api_key = api_key; c.model = model;
-    save_config(&state.kb_dir, &c);
+    if let Some(h) = hotkey { if !h.trim().is_empty() { c.hotkey = h.trim().to_string(); } }
+    let kb = state.kb_dir.lock().unwrap().clone();
+    save_config(&kb, &c);
+}
+
+// 知识库目录迁移：把 10-inbox/30-notes/90-archive + 配置搬到新目录，新目录若不存在则创建
+#[tauri::command]
+fn move_kb_dir(state: State<PetState>, new_dir: String) -> Result<String, String> {
+    let new_dir = new_dir.trim().to_string();
+    if new_dir.is_empty() { return Err("目录不能为空".into()); }
+    let nd = PathBuf::from(&new_dir);
+    let old_kb = state.kb_dir.lock().unwrap().clone();
+    if nd == old_kb { return Ok("目录未变化".into()); }
+    fs::create_dir_all(nd.join("10-inbox")).map_err(|e| format!("创建目录失败：{}", e))?;
+    fs::create_dir_all(nd.join("30-notes")).ok();
+    fs::create_dir_all(nd.join("90-archive")).ok();
+    // 迁移三个内容目录（不存在就跳过）
+    let mut moved = Vec::new();
+    for sub in ["10-inbox", "30-notes", "90-archive"] {
+        let s = old_kb.join(sub);
+        if !s.exists() { continue; }
+        let d = nd.join(sub);
+        if d.exists() {
+            // 合并：逐文件搬，冲突加序号
+            if let Ok(rd) = fs::read_dir(&s) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    let f = e.file_name().to_string_lossy().to_string();
+                    let mut dest = d.join(&f);
+                    let mut n = 1;
+                    while dest.exists() { n += 1; dest = d.join(format!("{}_{}.md", f.trim_end_matches(".md"), n)); }
+                    let _ = fs::rename(e.path(), &dest);
+                }
+            }
+            let _ = fs::remove_dir(&s);
+        } else {
+            fs::rename(&s, &d).map_err(|e| format!("移动 {} 失败：{}", sub, e))?;
+        }
+        moved.push(sub);
+    }
+    // 配置文件跟过去（.pet-config.json / .pet-bookmarks.json）
+    for cfg in [".pet-config.json", ".pet-bookmarks.json"] {
+        let s = old_kb.join(cfg);
+        if s.exists() { let _ = fs::rename(&s, nd.join(cfg)); }
+    }
+    let mut c = state.config.lock().unwrap();
+    c.kb_dir_override = new_dir.clone();
+    save_config(&nd, &c);
+    *state.kb_dir.lock().unwrap() = nd;
+    Ok(format!("知识库已迁移到 {}（{}）", new_dir, moved.join("、")))
 }
 
 #[tauri::command]
 fn stats(state: State<PetState>) -> serde_json::Value {
-    let items = scan_items(&state.kb_dir);
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let items = scan_items(&kb);
     let n = |s: &str| items.iter().filter(|i| i.status == s).count();
     serde_json::json!({
         "total": items.len(),
@@ -316,7 +443,7 @@ fn stats(state: State<PetState>) -> serde_json::Value {
         "read": n("read"),
         "carded": n("carded"),
         "queue": state.queue.lock().unwrap().len(),
-        "notes": fs::read_dir(state.kb_dir.join("30-notes")).map(|rd| rd.count()).unwrap_or(0),
+        "notes": fs::read_dir(kb.join("30-notes")).map(|rd| rd.count()).unwrap_or(0),
     })
 }
 
@@ -327,10 +454,11 @@ fn bubble(app: AppHandle, msg: String) {
 
 #[tauri::command]
 fn open_kb(state: State<PetState>) {
+    let kb = state.kb_dir.lock().unwrap().clone();
     #[cfg(target_os = "windows")]
-    { let _ = std::process::Command::new("explorer").arg(state.kb_dir.as_os_str()).spawn(); }
+    { let _ = std::process::Command::new("explorer").arg(kb.as_os_str()).spawn(); }
     #[cfg(not(target_os = "windows"))]
-    { let _ = std::process::Command::new("xdg-open").arg(state.kb_dir.as_os_str()).spawn(); }
+    { let _ = std::process::Command::new("xdg-open").arg(kb.as_os_str()).spawn(); }
 }
 
 #[tauri::command]
@@ -341,20 +469,49 @@ fn read_clipboard_text(app: AppHandle) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let kb = dirs_home().join("knowledge-base");
+    // 知识库目录：默认 ~/knowledge-pet（首次启动自动创建），支持设置页迁移
+    let mut kb = dirs_home().join("knowledge-pet");
     fs::create_dir_all(kb.join("10-inbox")).ok();
+    fs::create_dir_all(kb.join("20-sources")).ok();
     fs::create_dir_all(kb.join("30-notes")).ok();
-    let cfg = load_config(&kb);
+    fs::create_dir_all(kb.join("40-sop")).ok();
+    fs::create_dir_all(kb.join("90-archive")).ok();
+    let mut cfg = load_config(&kb);
+    if !cfg.kb_dir_override.is_empty() {
+        let od = PathBuf::from(&cfg.kb_dir_override);
+        if od.exists() {
+            kb = od;
+            fs::create_dir_all(kb.join("10-inbox")).ok();
+            fs::create_dir_all(kb.join("30-notes")).ok();
+            fs::create_dir_all(kb.join("90-archive")).ok();
+        }
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
-        .manage(PetState { kb_dir: kb, config: Mutex::new(cfg), queue: Mutex::new(Vec::new()) })
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_shell::init())
+        .manage(PetState { kb_dir: Mutex::new(kb), config: Mutex::new(cfg), queue: Mutex::new(Vec::new()) })
         .invoke_handler(tauri::generate_handler![
-            list_items, capture, process_queue, ai_make_card, mark_read,
-            get_config, set_config, stats, bubble, open_kb, read_clipboard_text
+            list_items, capture, process_queue, ai_make_card, mark_read, delete_item,
+            get_config, set_config, move_kb_dir, list_bookmarks, add_bookmark, remove_bookmark,
+            stats, bubble, open_kb, read_clipboard_text
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
+            // 全局热键：主动抓取（收剪贴板）。热键可配置，默认 Ctrl+Alt+C
+            {
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+                let cfg = load_config(&app.handle().state::<PetState>().kb_dir.lock().unwrap().clone());
+                let hotkey: Shortcut = cfg.hotkey.parse().unwrap_or_else(|_| "ctrl+alt+c".parse().unwrap());
+                app.global_shortcut().on_shortcut(hotkey, |app, _sc, ev| {
+                    if ev.state == ShortcutState::Pressed {
+                        // 触发前端 petClick：往 pet 窗发事件（前端监听后走同一收集逻辑）
+                        use tauri::Emitter;
+                        let _ = Emitter::emit(app, "hotkey-capture", ());
+                    }
+                }).ok();
+            }
             let show = MenuItem::with_id(app, "show", "打开管理面板", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
@@ -362,8 +519,22 @@ pub fn run() {
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, ev| {
+                    if matches!(ev, tauri::tray::TrayIconEvent::DoubleClick { .. }) {
+                        let app = tray.app_handle();
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.unminimize(); let _ = w.show(); let _ = w.set_focus();
+                            use tauri::Emitter; let _ = Emitter::emit(app, "switch-view", "panel");
+                        }
+                    }
+                })
                 .on_menu_event(|app, ev| match ev.id.as_ref() {
-                    "show" => { if let Some(w) = app.get_webview_window("main") { let _ = w.show(); let _ = w.set_focus(); } }
+                    "show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.unminimize(); let _ = w.show(); let _ = w.set_focus();
+                            use tauri::Emitter; let _ = Emitter::emit(app, "switch-view", "panel");
+                        }
+                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
