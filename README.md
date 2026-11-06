@@ -66,3 +66,11 @@ npm run tauri build    # 打包 exe
 ## License
 
 MIT
+
+## 🔌 集成（v0.4）：Notion + 飞书
+
+设置页拆成 4 个标签：🤖 AI 模型 / ⚙ 通用 / 📖 Notion / 💬 飞书。
+
+**Notion（手机学习入口）**：设置 → Notion 标签，填 Internal Integration Token（ntn_ 开头）+ 数据库 ID，测试连接后可预览数据库最近记录。第二期将支持拉取 Notion 新行 → AI 整理成本地知识卡。注意：必须在 Notion 数据库页面 ••• → 连接 里把 integration 加进去，否则报 404。
+
+**飞书（手机复习/提醒通道）**：飞书群 → 设置 → 群机器人 → 添加自定义机器人 → 复制 webhook 填入 → 可发测试消息、立即推今日冒泡。开启开关后每天 9 点自动把「每日冒泡」（今日知识卡+待办）推到飞书群。

@@ -22,3 +22,16 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Rust / Tauri
+src-tauri/target
+src-tauri/gen/schemas
+
+# 运行残留（桌宠在 exe 目录建的运行数据）
+.pet-*.json
+10-inbox/
+20-sources/
+30-notes/
+40-sop/
+50-drafts/
+90-archive/

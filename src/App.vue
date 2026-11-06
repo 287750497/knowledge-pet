@@ -5,14 +5,15 @@ import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import PetSprite from "./components/PetSprite.vue";
 
 interface Item { id: string; file: string; title: string; kind: string; url: string; status: string; created_at: string; error: string }
-interface AiConfig { base_url: string; api_key: string; model: string; hotkey: string; kb_dir_override: string }
+interface AiConfig { base_url: string; api_key: string; model: string; hotkey: string; kb_dir_override: string;
+  feishu_webhook: string; feishu_push_daily: boolean; notion_token: string; notion_db_id: string }
 interface Bookmark { title: string; url: string }
 interface Stats { total: number; seed: number; fetched: number; "fetch-failed": number; read: number; carded: number; queue: number; notes: number }
 
 const view = ref<"pet" | "panel" | "settings">("pet");
 const items = ref<Item[]>([]);
 const st = ref<Stats | null>(null);
-const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+Alt+C", kb_dir_override: "" });
+const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+Alt+C", kb_dir_override: "", feishu_webhook: "", feishu_push_daily: false, notion_token: "", notion_db_id: "" });
 const bookmarks = ref<Bookmark[]>([]);
 const bmNew = ref({ title: "", url: "" });
 const kbNew = ref("");
@@ -255,6 +256,60 @@ async function testConfig() {
   refresh();
 }
 
+// ---- 设置页标签 ----
+const setTab = ref<"general" | "ai" | "notion" | "feishu">("ai");
+const itgMsg = ref("");
+const notionPreviewRows = ref<string[]>([]);
+
+async function saveIntegrations() {
+  try {
+    await invoke("save_integrations", {
+      feishuWebhook: cfg.value.feishu_webhook,
+      feishuPushDaily: cfg.value.feishu_push_daily,
+      notionToken: cfg.value.notion_token,
+      notionDbId: cfg.value.notion_db_id,
+    });
+    showBubble("✓ 集成配置已保存");
+    itgMsg.value = "";
+  } catch (e) { showBubble("✗ " + String(e).slice(0, 80)); }
+}
+
+async function testFeishu() {
+  itgMsg.value = "发送测试消息中…";
+  try {
+    await invoke("save_integrations", {
+      feishuWebhook: cfg.value.feishu_webhook, feishuPushDaily: cfg.value.feishu_push_daily,
+      notionToken: cfg.value.notion_token, notionDbId: cfg.value.notion_db_id,
+    });
+    await invoke("feishu_test");
+    itgMsg.value = "✅ 测试消息已发到飞书群，去手机上看一眼";
+  } catch (e) { itgMsg.value = "❌ " + String(e).slice(0, 120); }
+}
+
+async function pushDailyNow() {
+  itgMsg.value = "推送中…";
+  try {
+    await invoke("feishu_push_daily");
+    itgMsg.value = "✅ 每日冒泡已推送到飞书";
+  } catch (e) { itgMsg.value = "❌ " + String(e).slice(0, 120); }
+}
+
+async function testNotion() {
+  itgMsg.value = "连接 Notion 中…";
+  try {
+    const msg = await invoke<string>("notion_test", { token: cfg.value.notion_token, dbId: cfg.value.notion_db_id });
+    itgMsg.value = msg;
+  } catch (e) { itgMsg.value = "❌ " + String(e).slice(0, 160); }
+}
+
+async function previewNotion() {
+  itgMsg.value = "拉取中…";
+  try {
+    notionPreviewRows.value = await invoke<string[]>("notion_preview", { token: cfg.value.notion_token, dbId: cfg.value.notion_db_id, limit: 5 });
+    itgMsg.value = notionPreviewRows.value.length ? "✅ 最近 " + notionPreviewRows.value.length + " 条：" : "数据库为空";
+  } catch (e) { itgMsg.value = "❌ " + String(e).slice(0, 160); }
+}
+
 const statusText: Record<string, string> = {
   seed: "🌱 新收", fetched: "📄 已爬正文", "fetch-failed": "❌ 抓取失败",
   read: "👁 已读", carded: "✨ 已成卡",
@@ -301,6 +356,7 @@ onMounted(async () => {
   refresh();
   loadBookmarks();
   pollTimer = window.setInterval(refresh, 5000);
+  dailyTimer = window.setInterval(checkDailyPush, 60000);
   // 全局热键触发主动抓取（在 pet 窗口执行收集）
   const un2 = await listen("hotkey-capture", async () => {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
@@ -353,7 +409,19 @@ async function openPanel() {
 
 // main 窗口关闭时隐藏而非退出（托盘常驻）
 // 用 Rust 侧 on_window_event 处理，前端只管 UI
-onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
+// 每日 9 点飞书推送：每分钟检查一次，当天推过就不再推
+let dailyTimer: number | undefined;
+let lastPushDate = "";
+async function checkDailyPush() {
+  const now = new Date();
+  const hm = now.getHours() * 60 + now.getMinutes();
+  const today = now.toDateString();
+  if (hm >= 540 && lastPushDate !== today && cfg.value.feishu_push_daily && cfg.value.feishu_webhook) {
+    lastPushDate = today;
+    try { await invoke("feishu_push_daily"); } catch (e) { console.warn("每日推送失败", e); }
+  }
+}
+onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearInterval(dailyTimer); });
 </script>
 
 <template>
@@ -489,7 +557,15 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
       <button class="mini" @click="view = 'panel'">← 返回</button>
       <h2>⚙ 设置</h2>
     </header>
+    <div class="settabs">
+      <button :class="{ active: setTab === 'ai' }" @click="setTab = 'ai'">🤖 AI 模型</button>
+      <button :class="{ active: setTab === 'general' }" @click="setTab = 'general'">⚙ 通用</button>
+      <button :class="{ active: setTab === 'notion' }" @click="setTab = 'notion'">📖 Notion</button>
+      <button :class="{ active: setTab === 'feishu' }" @click="setTab = 'feishu'">💬 飞书</button>
+    </div>
     <form @submit.prevent="saveConfig" class="cfgform">
+
+      <template v-if="setTab === 'ai'">
       <h3 class="sect">🤖 API 模型</h3>
       <label>API 地址（base_url）</label>
       <input v-model="cfg.base_url" placeholder="https://api.example.com/v1" />
@@ -502,7 +578,9 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
         <button type="submit" class="ok">💾 保存</button>
         <button type="button" class="mini" @click="testConfig">🧪 测试连接（用最新一条做真实整理）</button>
       </div>
+      </template>
 
+      <template v-if="setTab === 'general'">
       <h3 class="sect">⌨️ 主动抓取热键</h3>
       <label>全局热键（任意窗口按下即收剪贴板）</label>
       <input v-model="cfg.hotkey" placeholder="Ctrl+Alt+C" />
@@ -524,6 +602,46 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
       <div v-if="moving" class="progwrap"><div class="progbar" :style="{ width: prog + '%' }"></div></div>
       <p v-if="moveMsg" class="tip">{{ moveMsg }}</p>
       <p class="tip">默认知识库在软件（exe）所在目录下 knowledge-pet 文件夹，首次启动自动创建（含 10-inbox/20-sources/30-notes/40-sop/90-archive）。</p>
+      </template>
+
+      <template v-if="setTab === 'notion'">
+      <h3 class="sect">📖 Notion 连接（手机记录 → 桌宠整理）</h3>
+      <label>Internal Integration Token</label>
+      <input v-model="cfg.notion_token" type="password" placeholder="ntn_..." />
+      <label>数据库 ID（收集箱）</label>
+      <input v-model="cfg.notion_db_id" placeholder="数据库 URL 里 32 位字符串" />
+      <p class="tip">
+        步骤：① notion.so/developers 建一个 Internal Integration，拿到 token（ntn_ 开头）；
+        ② 在 Notion 里建「收集箱」数据库；③ 打开该数据库页面右上角 ••• → 连接 → 把你的 integration 加进去（不加这步必报 404）。
+        第二期将支持：定时拉取新行 → AI 整理成本地知识卡。
+      </p>
+      <div class="btns">
+        <button type="button" class="mini ok" @click="saveIntegrations">💾 保存</button>
+        <button type="button" class="mini" @click="testNotion">🔌 测试连接</button>
+        <button type="button" class="mini" @click="previewNotion">👀 预览最近 5 条</button>
+      </div>
+      <ul v-if="notionPreviewRows.length" class="notionpreview">
+        <li v-for="r in notionPreviewRows" :key="r">{{ r }}</li>
+      </ul>
+      <p v-if="itgMsg" class="tip" :class="{ err: itgMsg.startsWith('❌') }">{{ itgMsg }}</p>
+      </template>
+
+      <template v-if="setTab === 'feishu'">
+      <h3 class="sect">💬 飞书推送（知识冒泡 → 手机）</h3>
+      <label>自定义机器人 Webhook 地址</label>
+      <input v-model="cfg.feishu_webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+      <p class="tip">
+        步骤：飞书群里 → 设置 → 群机器人 → 添加机器人 → 自定义机器人 → 复制 Webhook 地址填到这里。
+        机器人只在那个群里发消息，不用建应用、不用审核。
+      </p>
+      <label class="chkline"><input type="checkbox" v-model="cfg.feishu_push_daily" /> 每天早上 9 点自动推送「每日冒泡」到飞书</label>
+      <div class="btns">
+        <button type="button" class="mini ok" @click="saveIntegrations">💾 保存</button>
+        <button type="button" class="mini" @click="testFeishu">💬 发测试消息</button>
+        <button type="button" class="mini" @click="pushDailyNow">🐱 立即推一条今日冒泡</button>
+      </div>
+      <p v-if="itgMsg" class="tip" :class="{ err: itgMsg.startsWith('❌') }">{{ itgMsg }}</p>
+      </template>
     </form>
   </div>
 </template>
@@ -610,6 +728,14 @@ h2 { font-size: 18px; flex: 1; }
 form > .sect:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
 
 /* 设置 */
+.settabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+.settabs button { border: 1px solid #ddd; background: #fff; border-radius: 999px; padding: 6px 14px; cursor: pointer; font-size: 13px; color: #444; }
+.settabs button.active { background: #f97316; color: #fff; border-color: #f97316; }
+.chkline { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #444; margin-top: 12px; cursor: pointer; }
+.notionpreview { list-style: none; padding: 0; margin: 10px 0; font-size: 12px; color: #555; background: #fff; border: 1px solid #e5e0d8; border-radius: 8px; }
+.notionpreview li { padding: 6px 10px; border-bottom: 1px solid #f0ece4; }
+.notionpreview li:last-child { border-bottom: 0; }
+.tip.err { color: #b91c1c; }
 .cfgform { max-width: 480px; display: flex; flex-direction: column; }
 .cfgform label { font-size: 13px; color: #555; margin: 10px 0 4px; }
 .cfgform input { padding: 9px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; }

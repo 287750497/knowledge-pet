@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod integrations;
+
 #[derive(Serialize, Clone)]
 pub struct Item {
     pub id: String,
@@ -27,13 +29,22 @@ pub struct AiConfig {
     pub hotkey: String,          // 主动抓取热键，默认 Ctrl+Alt+C
     #[serde(default)]
     pub kb_dir_override: String, // 知识库目录（空=默认 ~/knowledge-base）
+    // ---- 集成（v0.4）----
+    #[serde(default)]
+    pub feishu_webhook: String,      // 飞书自定义机器人 webhook
+    #[serde(default)]
+    pub feishu_push_daily: bool,     // 每日冒泡推送开关
+    #[serde(default)]
+    pub notion_token: String,        // Notion internal connection token
+    #[serde(default)]
+    pub notion_db_id: String,        // Notion 数据库 ID（收集箱）
 }
 
 fn default_hotkey() -> String { "Ctrl+Alt+C".into() }
 
 impl Default for AiConfig {
     fn default() -> Self {
-        AiConfig { base_url: String::new(), api_key: String::new(), model: String::new(), hotkey: default_hotkey(), kb_dir_override: String::new() }
+        AiConfig { base_url: String::new(), api_key: String::new(), model: String::new(), hotkey: default_hotkey(), kb_dir_override: String::new(), feishu_webhook: String::new(), feishu_push_daily: false, notion_token: String::new(), notion_db_id: String::new() }
     }
 }
 
@@ -494,7 +505,7 @@ pub fn run() {
     fs::create_dir_all(kb.join("40-sop")).ok();
     fs::create_dir_all(kb.join("50-drafts")).ok();
     fs::create_dir_all(kb.join("90-archive")).ok();
-    let mut cfg = load_config(&kb);
+    let cfg = load_config(&kb);
     if !cfg.kb_dir_override.is_empty() {
         let od = PathBuf::from(&cfg.kb_dir_override);
         if od.exists() {
@@ -514,7 +525,10 @@ pub fn run() {
             list_items, capture, process_queue, ai_make_card, mark_read, delete_item,
             get_config, set_config, move_kb_dir, list_bookmarks, add_bookmark, remove_bookmark,
             stats, bubble, open_kb, read_clipboard_text,
-            list_cards, quote_create, list_drafts, gen_topics, daily_review
+            list_cards, quote_create, list_drafts, gen_topics, daily_review,
+            integrations::feishu_test, integrations::feishu_push_daily,
+            integrations::notion_test, integrations::notion_preview,
+            integrations::save_integrations
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
@@ -746,23 +760,36 @@ async fn gen_topics(state: State<'_, PetState>) -> Result<Vec<String>, String> {
     Ok(content.lines().filter(|l| !l.trim().is_empty()).map(|s| s.to_string()).collect())
 }
 
-/// 每日冒泡：随机挑一张卡 + 未完成的下一步行动
-#[tauri::command]
-fn daily_review(state: State<PetState>) -> Result<serde_json::Value, String> {
-    let kb = state.kb_dir.lock().unwrap().clone();
-    let cards = scan_cards(&kb);
+/// 每日冒泡内部逻辑（integrations 模块复用）
+#[derive(serde::Serialize)]
+pub struct DailyReview { pub title: String, pub conclusion: String, pub todos: Vec<String> }
+
+pub fn daily_review_inner(kb: &std::path::PathBuf) -> Result<DailyReview, String> {
+    let cards = scan_cards(kb);
     if cards.is_empty() { return Err("知识库还没有知识卡".into()); }
     // 简单按日期轮换：当天日期 mod 卡数
     let seed: u64 = chrono_today().chars().filter_map(|c| c.to_digit(10)).fold(0u64, |a, d| a * 10 + d as u64);
     let card = &cards[(seed as usize) % cards.len()];
     let text = fs::read_to_string(kb.join(&card.file)).unwrap_or_default();
+    // 一句话结论 = "# 一句话结论" 后第一段非空行
     // 抽未勾选的 action
     let todos: Vec<String> = text.lines()
         .filter(|l| l.trim_start().starts_with("- [ ]"))
         .map(|l| l.trim().trim_start_matches("- [ ]").trim().to_string())
         .filter(|t| !t.is_empty())
         .collect();
-    Ok(serde_json::json!({ "card": card, "todos": todos }))
+    let conclusion = text.splitn(2, "# 一句话结论").nth(1)
+        .and_then(|rest| rest.lines().find(|l| !l.trim().is_empty()))
+        .unwrap_or(card.title.as_str()).trim().to_string();
+    Ok(DailyReview { title: card.title.clone(), conclusion, todos })
+}
+
+/// 每日冒泡命令
+#[tauri::command]
+fn daily_review(state: State<PetState>) -> Result<serde_json::Value, String> {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let r = daily_review_inner(&kb)?;
+    Ok(serde_json::json!({ "card": { "title": r.title, "conclusion": r.conclusion }, "todos": r.todos }))
 }
 
 
