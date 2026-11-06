@@ -31,6 +31,19 @@
         "height": 560,
         "visible": false,
         "resizable": true
+      },
+      {
+        "label": "bowl",
+        "title": "KnowledgePetBowl",
+        "width": 90,
+        "height": 90,
+        "x": 1010,
+        "y": 620,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false
       }
     ],
     "security": {

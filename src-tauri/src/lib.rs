@@ -386,7 +386,7 @@ fn set_config(state: State<PetState>, base_url: String, api_key: String, model: 
 
 // 知识库目录迁移：把 10-inbox/30-notes/90-archive + 配置搬到新目录，新目录若不存在则创建
 #[tauri::command]
-fn move_kb_dir(state: State<PetState>, new_dir: String) -> Result<String, String> {
+fn move_kb_dir(app: AppHandle, state: State<'_, PetState>, new_dir: String) -> Result<String, String> {
     let new_dir = new_dir.trim().to_string();
     if new_dir.is_empty() { return Err("目录不能为空".into()); }
     let nd = PathBuf::from(&new_dir);
@@ -417,6 +417,8 @@ fn move_kb_dir(state: State<PetState>, new_dir: String) -> Result<String, String
             fs::rename(&s, &d).map_err(|e| format!("移动 {} 失败：{}", sub, e))?;
         }
         moved.push(sub);
+        use tauri::Emitter;
+        let _ = Emitter::emit_to(&app, "main", "kb-move-progress", format!("{}|{}", moved.len(), 3));
     }
     // 配置文件跟过去（.pet-config.json / .pet-bookmarks.json）
     for cfg in [".pet-config.json", ".pet-bookmarks.json"] {
@@ -469,9 +471,13 @@ fn read_clipboard_text(app: AppHandle) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 知识库目录：默认 ~/knowledge-pet（首次启动自动创建），支持设置页迁移
-    let mut kb = dirs_home().join("knowledge-pet");
-    fs::create_dir_all(kb.join("10-inbox")).ok();
+    // 知识库目录：默认 = exe 所在目录/knowledge-pet（软件启动位置），支持设置页迁移
+    let mut kb = exe_dir().join("knowledge-pet");
+    // 目录与 exe 同名（Linux 下 exe 无 .exe 后缀会撞名）时回退用户目录
+    if fs::create_dir_all(kb.join("10-inbox")).is_err() {
+        kb = dirs_home().join("knowledge-pet");
+        fs::create_dir_all(kb.join("10-inbox")).ok();
+    }
     fs::create_dir_all(kb.join("20-sources")).ok();
     fs::create_dir_all(kb.join("30-notes")).ok();
     fs::create_dir_all(kb.join("40-sop")).ok();
@@ -490,6 +496,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(PetState { kb_dir: Mutex::new(kb), config: Mutex::new(cfg), queue: Mutex::new(Vec::new()) })
         .invoke_handler(tauri::generate_handler![
             list_items, capture, process_queue, ai_make_card, mark_read, delete_item,
@@ -552,6 +559,13 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running knowledge-pet");
+}
+
+// 默认知识库 = exe 所在目录/knowledge-pet（软件启动位置）
+fn exe_dir() -> PathBuf {
+    std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(dirs_home)
 }
 
 fn dirs_home() -> PathBuf {

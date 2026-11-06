@@ -8,7 +8,7 @@ interface AiConfig { base_url: string; api_key: string; model: string; hotkey: s
 interface Bookmark { title: string; url: string }
 interface Stats { total: number; seed: number; fetched: number; "fetch-failed": number; read: number; carded: number; queue: number; notes: number }
 
-const view = ref<"pet" | "panel" | "settings">("pet");
+const view = ref<"pet" | "panel" | "settings" | "bowl">("pet");
 const items = ref<Item[]>([]);
 const st = ref<Stats | null>(null);
 const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+Alt+C", kb_dir_override: "" });
@@ -39,6 +39,32 @@ async function petClick() {
     if (!text || !text.trim()) { showBubble("⚠️ 剪贴板是空的，先复制点东西"); return; }
     const it = await invoke<Item>("capture", { text });
     showBubble(it.kind === "url" ? "📥 收到网址，排队抓取" : "📥 收到，已放进收件箱");
+    refresh();
+  } catch (e) {
+    showBubble("⚠️ " + String(e).replace(/^.*：/, ""));
+  }
+}
+
+function petDrag(e: PointerEvent) {
+  // 单击=收藏，双击=面板；按住移动=拖动（交给系统 startDragging）
+  if (e.button !== 0) return;
+  const t = setTimeout(() => { (async () => {
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().startDragging();
+    } catch {}
+  })(); }, 180);
+  const clear = () => { clearTimeout(t); window.removeEventListener("pointerup", clear); };
+  window.addEventListener("pointerup", clear);
+}
+
+async function bowlClick() {
+  try {
+    let text = "";
+    try { text = await readText(); } catch { text = ""; }
+    if (!text || !text.trim()) { showBubble("⚠️ 碗是空的，先复制点东西"); return; }
+    const it = await invoke<Item>("capture", { text });
+    showBubble(it.kind === "url" ? "🍚 吃掉一个网址" : "🍚 吃掉一段文字");
     refresh();
   } catch (e) {
     showBubble("⚠️ " + String(e).replace(/^.*：/, ""));
@@ -104,11 +130,29 @@ async function delBm(url: string) {
   loadBookmarks();
 }
 
+const moving = ref(false);
+const prog = ref(0);
+const moveMsg = ref("");
+
+async function browseKb() {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const sel = await open({ directory: true, multiple: false, title: "选择知识库目录" });
+    if (typeof sel === "string" && sel) kbNew.value = sel;
+  } catch (e) { showBubble("⚠️ " + String(e)); }
+}
+
 async function moveKb() {
-  if (!kbNew.value.trim()) { showBubble("⚠️ 先填新目录路径"); return; }
-  showBubble("🚚 迁移中…");
-  try { showBubble("✓ " + await invoke<string>("move_kb_dir", { newDir: kbNew.value })); }
-  catch (e) { showBubble("⚠️ " + String(e)); }
+  if (!kbNew.value.trim() || moving.value) return;
+  moving.value = true; prog.value = 5; moveMsg.value = "🚚 正在迁移…";
+  try {
+    const msg = await invoke<string>("move_kb_dir", { newDir: kbNew.value });
+    prog.value = 100; moveMsg.value = "✓ " + msg;
+    cfg.value = await invoke<AiConfig>("get_config");
+    showBubble("✓ 知识库已迁移");
+  } catch (e) { moveMsg.value = "⚠️ " + String(e); prog.value = 0; }
+  moving.value = false;
+  setTimeout(() => { prog.value = 0; }, 3000);
   refresh();
 }
 
@@ -164,6 +208,12 @@ onMounted(async () => {
       onUnmounted(() => unR());
     }
   } catch {}
+  const unP = await listen<string>("kb-move-progress", (e) => {
+    const [cur, total] = String(e.payload).split("|").map(Number);
+    prog.value = Math.round(5 + (cur / Math.max(total, 1)) * 90);
+    moveMsg.value = `🚚 已迁移 ${cur}/${total} 个目录…`;
+  });
+  onUnmounted(() => unP());
   const winLabel = await (async () => {
     try { const { getCurrentWindow } = await import("@tauri-apps/api/window"); return getCurrentWindow().label; }
     catch { return "main"; }
@@ -177,7 +227,7 @@ onMounted(async () => {
   try {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const label = getCurrentWindow().label;
-    view.value = label === "pet" ? "pet" : "panel";
+    view.value = label === "pet" ? "pet" : (label === "bowl" ? "bowl" : "panel");
   } catch { view.value = "panel"; }
   cfg.value = await invoke<AiConfig>("get_config");
   refresh();
@@ -242,11 +292,17 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
   <!-- 桌宠视图 -->
   <div v-if="view === 'pet'" class="petwrap">
     <div v-if="bubbleShow" class="bubble">{{ bubble }}</div>
-    <div class="pet" @click="petClick" @dblclick="openPanel" title="单击收藏剪贴板 / 双击打开面板">
+    <div class="pet" @click="petClick" @dblclick="openPanel" @pointerdown="petDrag" title="拖动移动 / 单击收藏 / 双击面板">
       <div class="pet-face">🐱</div>
       <div class="pet-body"></div>
     </div>
     <div class="pet-hint" v-if="st">📥 {{ st.total }} · 待爬 {{ st.queue }}</div>
+  </div>
+
+  <!-- 食盆视图 -->
+  <div v-else-if="view === 'bowl'" class="bowlwrap">
+    <div v-if="bubbleShow" class="bubble">{{ bubble }}</div>
+    <div class="bowl" @click="bowlClick" title="点食盆喂食 = 收藏剪贴板">🍚</div>
   </div>
 
   <!-- 管理面板 -->
@@ -335,13 +391,20 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
 
       <h3 class="sect">📁 知识库目录</h3>
       <label>当前目录</label>
-      <input :value="cfg.kb_dir_override || '默认（用户目录/knowledge-pet）'" disabled />
+      <input :value="cfg.kb_dir_override || '默认（exe 所在目录/knowledge-pet）'" disabled />
       <label>迁移到新目录</label>
-      <input v-model="kbNew" placeholder="D:\知识库\knowledge-pet" />
-      <div class="btns">
-        <button type="button" class="mini" @click="moveKb">🚚 迁移（自动搬 inbox/知识卡/常用网址）</button>
+      <div class="rowsep">
+        <input v-model="kbNew" placeholder="D:\知识库\knowledge-pet" class="grow" />
+        <button type="button" class="mini" @click="browseKb">📂 浏览</button>
       </div>
-      <p class="tip">首次启动会自动在用户目录创建 knowledge-pet（含 10-inbox/20-sources/30-notes/40-sop/90-archive）。迁移会把内容整体搬到新目录。</p>
+      <div class="btns">
+        <button type="button" class="mini ok" :disabled="moving || !kbNew.trim()" @click="moveKb">
+          {{ moving ? "🚚 迁移中…" : "🚚 迁移（自动搬 inbox/知识卡/常用网址）" }}
+        </button>
+      </div>
+      <div v-if="moving" class="progwrap"><div class="progbar" :style="{ width: prog + '%' }"></div></div>
+      <p v-if="moveMsg" class="tip">{{ moveMsg }}</p>
+      <p class="tip">默认知识库在软件（exe）所在目录下 knowledge-pet 文件夹，首次启动自动创建（含 10-inbox/20-sources/30-notes/40-sop/90-archive）。</p>
     </form>
   </div>
 </template>
@@ -350,6 +413,17 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
 * { box-sizing: border-box; margin: 0; }
 html, body { background: transparent !important; }
 body { font-family: system-ui, "Microsoft YaHei"; overflow: hidden; }
+
+/* 食盆 */
+.bowlwrap { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+.bowl { font-size: 52px; cursor: pointer; user-select: none; filter: drop-shadow(0 2px 4px rgba(0,0,0,.35)); transition: transform .15s; }
+.bowl:hover { transform: scale(1.12); }
+.bowl:active { transform: scale(0.9); }
+/* 进度条 */
+.progwrap { height: 8px; background: #eee; border-radius: 999px; margin: 10px 0 4px; overflow: hidden; }
+.progbar { height: 100%; background: #f97316; border-radius: 999px; transition: width .3s; }
+.rowsep { display: flex; gap: 6px; align-items: center; }
+.rowsep .grow { flex: 1; }
 
 /* 桌宠 */
 .petwrap { width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; }
