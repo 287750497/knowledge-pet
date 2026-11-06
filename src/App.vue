@@ -29,6 +29,7 @@ const shown = computed(() =>
 async function refresh() {
   items.value = await invoke<Item[]>("list_items");
   st.value = await invoke<Stats>("stats");
+  try { await loadCards(); } catch { /* 旧库无 30-notes */ }
 }
 
 // 桌宠单击：收剪贴板
@@ -128,6 +129,45 @@ async function addBm() {
 async function delBm(url: string) {
   await invoke("remove_bookmark", { url });
   loadBookmarks();
+}
+
+// ---- 知识卡工坊（引用创作/跨卡选题/每日冒泡）----
+interface CardItem { file: string; title: string; tags: string; status: string; url: string; created: string; conclusion: string }
+const cards = ref<CardItem[]>([]);
+const drafts = ref<CardItem[]>([]);
+const picked = ref<Set<string>>(new Set());
+const goal = ref("");
+const topics = ref<string[]>([]);
+const review = ref<{ card: CardItem; todos: string[] } | null>(null);
+
+function togglePick(f: string) {
+  const s = new Set(picked.value);
+  if (s.has(f)) s.delete(f); else if (s.size < 5) s.add(f); else { showBubble("一次最多勾 5 张"); return; }
+  picked.value = s;
+}
+async function loadCards() {
+  cards.value = await invoke<CardItem[]>("list_cards");
+  drafts.value = await invoke<CardItem[]>("list_drafts");
+}
+async function doQuoteCreate() {
+  if (!goal.value.trim()) { showBubble("先写写作任务"); return; }
+  busy.value = { ...busy.value, quote: true };
+  try {
+    showBubble("✍️ " + await invoke<string>("quote_create", { files: [...picked.value], goal: goal.value }));
+    goal.value = ""; picked.value = new Set();
+    await loadCards();
+  } catch (e) { showBubble("⚠️ " + String(e).replace(/^.*：/, "")); }
+  finally { busy.value = { ...busy.value, quote: false }; }
+}
+async function doGenTopics() {
+  busy.value = { ...busy.value, topics: true };
+  try { topics.value = await invoke<string[]>("gen_topics"); }
+  catch (e) { showBubble("⚠️ " + String(e).replace(/^.*：/, "")); }
+  finally { busy.value = { ...busy.value, topics: false }; }
+}
+async function doDailyReview() {
+  try { review.value = await invoke<any>("daily_review"); }
+  catch (e) { showBubble("⚠️ " + String(e).replace(/^.*：/, "")); }
 }
 
 const moving = ref(false);
@@ -349,6 +389,39 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
       <p v-if="!shown.length" class="empty">空空如也。去别的窗口复制点东西，然后点一下桌宠 🐱</p>
     </div>
 
+    <h3 class="bmtitle">🐱 每日冒泡 <button class="mini" @click="doDailyReview">抽一张</button></h3>
+    <div v-if="review" class="cardblock" style="border-left:3px solid #f97316">
+      <b>《{{ review.card.title }}》</b> <span class="mut">{{ review.card.tags }}</span>
+      <p class="mut" style="margin:4px 0">{{ review.card.conclusion }}</p>
+      <p v-if="review.todos.length" class="mut">待办：{{ review.todos.join("；") }}</p>
+    </div>
+
+    <h3 class="bmtitle">💡 跨卡选题 <button class="mini" :disabled="busy.topics" @click="doGenTopics">{{ busy.topics ? "思考中…" : "AI 碰撞 5 个选题" }}</button></h3>
+    <div v-if="topics.length" class="cardblock">
+      <p v-for="(t, i) in topics" :key="i" class="mut" style="margin:6px 0">{{ t }}</p>
+    </div>
+
+    <h3 class="bmtitle">✍️ 引用创作（勾 2-5 张卡，AI 照素材写稿）</h3>
+    <div class="cardblock">
+      <div v-for="c in cards" :key="c.file" class="cardrow" :class="{ picked: picked.has(c.file) }" @click="togglePick(c.file)">
+        <input type="checkbox" :checked="picked.has(c.file)" style="pointer-events:none" />
+        <div style="flex:1;min-width:0">
+          <b>{{ c.title }}</b> <span class="mut">{{ c.tags }} · {{ c.created }}</span>
+          <div class="mut" style="font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ c.conclusion }}</div>
+        </div>
+      </div>
+      <p v-if="!cards.length" class="empty">还没有知识卡——先「AI 整理成卡」</p>
+      <textarea v-model="goal" rows="2" placeholder="写作任务，如：结合这几张卡写一篇公众号开头（150字），观点用卡里原话"></textarea>
+      <button class="primary" :disabled="busy.quote || !picked.size" @click="doQuoteCreate">{{ busy.quote ? "生成中…" : `用 ${picked.size} 张卡生成草稿` }}</button>
+    </div>
+
+    <div v-if="drafts.length" class="cardblock">
+      <h3 class="bmtitle" style="margin-top:0">📄 草稿（50-drafts/）</h3>
+      <div v-for="d in drafts" :key="d.file" class="mut" style="margin:4px 0;font-size:12px">
+        📄 {{ d.title }} <span class="mut">· {{ d.created }} · 用卡：{{ d.tags }}</span>
+      </div>
+    </div>
+
     <h3 class="bmtitle">⭐ 常用网址</h3>
     <div class="bmform">
       <input v-model="bmNew.title" placeholder="名称（可空）" class="bm-title" />
@@ -487,3 +560,10 @@ form > .sect:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
 .cfgform input { padding: 9px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; }
 .tip { font-size: 12px; color: #999; margin: 12px 0; }
 </style>
+
+/* 知识卡工坊 */
+.cardblock { border: 1px solid var(--line, #e5e7eb); border-radius: 10px; padding: 10px; margin: 8px 0; }
+.cardrow { display: flex; gap: 8px; align-items: center; padding: 6px; border-radius: 8px; cursor: pointer; }
+.cardrow:hover { background: rgba(99,102,241,.08); }
+.cardrow.picked { background: rgba(99,102,241,.15); }
+.mut { color: #6b7280; }

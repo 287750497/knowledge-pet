@@ -481,6 +481,7 @@ pub fn run() {
     fs::create_dir_all(kb.join("20-sources")).ok();
     fs::create_dir_all(kb.join("30-notes")).ok();
     fs::create_dir_all(kb.join("40-sop")).ok();
+    fs::create_dir_all(kb.join("50-drafts")).ok();
     fs::create_dir_all(kb.join("90-archive")).ok();
     let mut cfg = load_config(&kb);
     if !cfg.kb_dir_override.is_empty() {
@@ -501,7 +502,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_items, capture, process_queue, ai_make_card, mark_read, delete_item,
             get_config, set_config, move_kb_dir, list_bookmarks, add_bookmark, remove_bookmark,
-            stats, bubble, open_kb, read_clipboard_text
+            stats, bubble, open_kb, read_clipboard_text,
+            list_cards, quote_create, list_drafts, gen_topics, daily_review
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
@@ -573,4 +575,250 @@ fn dirs_home() -> PathBuf {
     { std::env::var("USERPROFILE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/Users/Public")) }
     #[cfg(not(target_os = "windows"))]
     { std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp")) }
+}
+
+
+// ================= 一期二期：引用创作 / 快照 / 跨卡选题 / 每日冒泡 =================
+
+#[derive(Serialize, Clone)]
+pub struct CardItem {
+    pub file: String,     // 相对路径
+    pub title: String,
+    pub tags: String,
+    pub status: String,
+    pub url: String,
+    pub created: String,
+    pub conclusion: String, // 一句话结论（正文第一个 # 段）
+}
+
+/// 扫描 30-notes 全部知识卡
+fn scan_cards(kb: &PathBuf) -> Vec<CardItem> {
+    let mut out = Vec::new();
+    let dir = kb.join("30-notes");
+    let Ok(rd) = fs::read_dir(&dir) else { return out };
+    let mut paths: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false)).collect();
+    paths.sort();
+    for p in paths.into_iter().rev() {
+        let Ok(text) = fs::read_to_string(&p) else { continue };
+        let rel = format!("30-notes/{}", p.file_name().unwrap().to_string_lossy());
+        // 一句话结论 = "# 一句话结论" 标题后的第一个非空段
+        let mut conclusion = String::new();
+        if let Some(i) = text.find("# 一句话结论") {
+            for line in text[i + "# 一句话结论".len()..].lines() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with('#') { if !conclusion.is_empty() || t.starts_with('#') { break; } continue; }
+                conclusion.push_str(t); break;
+            }
+        }
+        out.push(CardItem {
+            title: fm_field(&text, "title").unwrap_or_else(|| p.file_stem().unwrap().to_string_lossy().to_string()),
+            tags: fm_field(&text, "tags").unwrap_or_default(),
+            status: fm_field(&text, "status").unwrap_or_default(),
+            url: fm_field(&text, "url").unwrap_or_default(),
+            created: fm_field(&text, "date").or_else(|| fm_field(&text, "created")).unwrap_or_default(),
+            conclusion: conclusion.chars().take(120).collect(),
+            file: rel,
+        });
+    }
+    out
+}
+
+#[tauri::command]
+fn list_cards(state: State<PetState>) -> Vec<CardItem> {
+    scan_cards(&state.kb_dir.lock().unwrap().clone())
+}
+
+async fn ai_chat(cfg: &AiConfig, prompt: &str) -> Result<String, String> {
+    if cfg.api_key.is_empty() || cfg.base_url.is_empty() { return Err("请先在设置里配置 API".into()); }
+    let cli = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
+    let resp = cli.post(format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')))
+        .bearer_auth(&cfg.api_key)
+        .json(&serde_json::json!({
+            "model": cfg.model,
+            "messages": [{"role":"user","content":prompt}]
+        }))
+        .send().await.map_err(|e| format!("AI 请求失败：{}", e))?;
+    let j: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    j.pointer("/choices/0/message/content").and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("AI 返回异常：{}", serde_json::to_string(&j).unwrap_or_default().chars().take(200).collect::<String>()))
+}
+
+/// 引用创作：勾选知识卡 + 写作要求 → AI 生成草稿 → 存 50-drafts/，快照内嵌
+#[tauri::command]
+async fn quote_create(state: State<'_, PetState>, files: Vec<String>, goal: String) -> Result<String, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    let kb = state.kb_dir.lock().unwrap().clone();
+    if files.is_empty() { return Err("先勾选至少一张知识卡".into()); }
+    // 读取卡片原文（快照）
+    let mut snapshot = String::new();
+    let mut used = Vec::new();
+    for f in &files {
+        let text = fs::read_to_string(kb.join(f)).map_err(|e| format!("读卡失败 {f}: {e}"))?;
+        used.push(f.clone());
+        snapshot.push_str(&format!("\n\n----- 知识卡：{} -----\n{}", f, text));
+    }
+    let prompt = format!(
+        "你是内容创作助手。基于下面的知识卡素材完成写作任务。\n铁律：观点和事实尽量来自知识卡原文（可引用原句）；知识卡里没有的数据/事实一律不写，不许编造。\n直接输出正文（Markdown），不要额外解释。\n\n【写作任务】\n{}\n\n【知识卡素材】{}",
+        goal, snapshot
+    );
+    let content = ai_chat(&cfg, &prompt).await?;
+    // 草稿文件：frontmatter 含 used 快照
+    let fname = format!("{}-{}.md", chrono_today(), sanitize(&goal.chars().take(24).collect::<String>()));
+    let dir = kb.join("50-drafts");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let doc = format!(
+        "---\nkind: draft\ncreated: {}\nused: {}\ntask: \"{}\"\n---\n\n{}",
+        chrono_today(), used.join(", "), goal.replace('"', "'"), content
+    );
+    fs::write(dir.join(&fname), doc).map_err(|e| e.to_string())?;
+    Ok(format!("草稿已生成：50-drafts/{}", fname))
+}
+
+/// 列出草稿（50-drafts）
+#[tauri::command]
+fn list_drafts(state: State<PetState>) -> Vec<CardItem> {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(kb.join("50-drafts")) else { return out };
+    let mut paths: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false)).collect();
+    paths.sort();
+    for p in paths.into_iter().rev() {
+        let Ok(text) = fs::read_to_string(&p) else { continue };
+        out.push(CardItem {
+            title: fm_field(&text, "task").unwrap_or_else(|| p.file_stem().unwrap().to_string_lossy().to_string()),
+            tags: fm_field(&text, "used").unwrap_or_default(),
+            status: "draft".into(),
+            url: String::new(),
+            created: fm_field(&text, "created").unwrap_or_default(),
+            conclusion: String::new(),
+            file: format!("50-drafts/{}", p.file_name().unwrap().to_string_lossy()),
+        });
+    }
+    out
+}
+
+/// 跨卡选题：AI 扫全部 seed 卡，两两碰撞出选题
+#[tauri::command]
+async fn gen_topics(state: State<'_, PetState>) -> Result<Vec<String>, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let cards = scan_cards(&kb);
+    if cards.len() < 2 { return Err("知识卡不足 2 张，先去收集素材".into()); }
+    let digest = cards.iter().map(|c| format!("- 《{}》({})：{}", c.title, c.tags, c.conclusion)).collect::<Vec<_>>().join("\n");
+    let prompt = format!(
+        "下面是我的知识卡片清单（标题+标签+一句话结论）。请把它们两两组合、跨领域碰撞，提炼 5 个值得写的选题。\n每个选题一行，格式：「选题名 — 用哪几张卡（引用标题）— 为什么值得写（一句话）」。只输出 5 行。\n\n{}", digest
+    );
+    let content = ai_chat(&cfg, &prompt).await?;
+    Ok(content.lines().filter(|l| !l.trim().is_empty()).map(|s| s.to_string()).collect())
+}
+
+/// 每日冒泡：随机挑一张卡 + 未完成的下一步行动
+#[tauri::command]
+fn daily_review(state: State<PetState>) -> Result<serde_json::Value, String> {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let cards = scan_cards(&kb);
+    if cards.is_empty() { return Err("知识库还没有知识卡".into()); }
+    // 简单按日期轮换：当天日期 mod 卡数
+    let seed: u64 = chrono_today().chars().filter_map(|c| c.to_digit(10)).fold(0u64, |a, d| a * 10 + d as u64);
+    let card = &cards[(seed as usize) % cards.len()];
+    let text = fs::read_to_string(kb.join(&card.file)).unwrap_or_default();
+    // 抽未勾选的 action
+    let todos: Vec<String> = text.lines()
+        .filter(|l| l.trim_start().starts_with("- [ ]"))
+        .map(|l| l.trim().trim_start_matches("- [ ]").trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    Ok(serde_json::json!({ "card": card, "todos": todos }))
+}
+
+
+#[cfg(test)]
+mod workshop_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_scan_cards_extracts_conclusion() {
+        let dir = std::env::temp_dir().join(format!("pet-test-{}", std::process::id()));
+        let notes = dir.join("30-notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("20261104-判断力.md"),
+            "---\ntitle: 判断力比提示词重要\ntags: [自媒体, AI]\ndate: 2026-11-04\nstatus: seed\n---\n\n# 一句话结论\n\n很多人用 AI 的问题是不知道怎么判断。\n\n## 展开\n\n- 要点一\n\n## 下一步行动\n\n- [ ] 写成公众号文章\n- [x] 已完成的\n").unwrap();
+        let kb = dir.clone();
+        let cards = scan_cards(&kb);
+        assert_eq!(cards.len(), 1);
+        let c = &cards[0];
+        assert_eq!(c.title, "判断力比提示词重要");
+        assert_eq!(c.tags, "[自媒体, AI]");
+        assert!(c.conclusion.contains("不知道怎么判断"), "conclusion={}", c.conclusion);
+        assert!(!c.conclusion.contains("要点一"), "结论不应混入展开段");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_quote_create_snapshot_flow() {
+        let dir = std::env::temp_dir().join(format!("pet-test-q-{}", std::process::id()));
+        let notes = dir.join("30-notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("card-a.md"), "---\ntitle: 卡A\n---\n\n# 一句话结论\n\n内容A").unwrap();
+        // 模拟 quote_create 的快照与落盘逻辑（不走 AI）
+        let kb = dir.clone();
+        let files = vec!["30-notes/card-a.md".to_string()];
+        let mut used = Vec::new();
+        let mut snapshot = String::new();
+        for f in &files {
+            let text = fs::read_to_string(kb.join(f)).unwrap();
+            used.push(f.clone());
+            snapshot.push_str(&format!("\n\n----- 知识卡：{} -----\n{}", f, text));
+        }
+        assert!(snapshot.contains("内容A"));
+        let goal = "写一篇开头";
+        let fname = format!("{}-{}.md", chrono_today(), sanitize(&goal.chars().take(24).collect::<String>()));
+        let doc = format!("---\nkind: draft\ncreated: {}\nused: {}\ntask: \"{}\"\n---\n\n正文", chrono_today(), used.join(", "), goal.replace('"', "'"));
+        fs::create_dir_all(kb.join("50-drafts")).unwrap();
+        fs::write(kb.join("50-drafts").join(&fname), &doc).unwrap();
+        // 验证 list_drafts 能读到
+        let drafts = {
+            // 复用 list_drafts 内部逻辑
+            let mut out = Vec::new();
+            let rd = fs::read_dir(kb.join("50-drafts")).unwrap();
+            for e in rd.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.extension().map(|x| x == "md").unwrap_or(false) {
+                    let t = fs::read_to_string(&p).unwrap();
+                    out.push(fm_field(&t, "used").unwrap_or_default());
+                }
+            }
+            out
+        };
+        assert_eq!(drafts, vec!["30-notes/card-a.md".to_string()]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_daily_review_rotation() {
+        let dir = std::env::temp_dir().join(format!("pet-test-r-{}", std::process::id()));
+        let notes = dir.join("30-notes");
+        fs::create_dir_all(&notes).unwrap();
+        for name in ["a", "b", "c"] {
+            fs::write(notes.join(format!("20261104-{}.md", name)),
+                format!("---\ntitle: 卡{}\n---\n\n# 一句话结论\n\n内容{}\n\n- [ ] 待办{}", name.to_uppercase(), name, name)).unwrap();
+        }
+        let kb = dir.clone();
+        let cards = scan_cards(&kb);
+        assert_eq!(cards.len(), 3);
+        let seed: u64 = chrono_today().chars().filter_map(|c| c.to_digit(10)).fold(0u64, |a, d| a * 10 + d as u64);
+        let card = &cards[(seed as usize) % cards.len()];
+        let text = fs::read_to_string(kb.join(&card.file)).unwrap();
+        let todos: Vec<String> = text.lines()
+            .filter(|l| l.trim_start().starts_with("- [ ]"))
+            .map(|l| l.trim().trim_start_matches("- [ ]").trim().to_string())
+            .collect();
+        assert_eq!(todos.len(), 1);
+        assert!(todos[0].starts_with("待办"), "todos={:?} card={}", todos, card.title);
+        fs::remove_dir_all(&dir).ok();
+    }
 }
