@@ -2,13 +2,14 @@
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
+import PetSprite from "./components/PetSprite.vue";
 
 interface Item { id: string; file: string; title: string; kind: string; url: string; status: string; created_at: string; error: string }
 interface AiConfig { base_url: string; api_key: string; model: string; hotkey: string; kb_dir_override: string }
 interface Bookmark { title: string; url: string }
 interface Stats { total: number; seed: number; fetched: number; "fetch-failed": number; read: number; carded: number; queue: number; notes: number }
 
-const view = ref<"pet" | "panel" | "settings" | "bowl">("pet");
+const view = ref<"pet" | "panel" | "settings">("pet");
 const items = ref<Item[]>([]);
 const st = ref<Stats | null>(null);
 const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+Alt+C", kb_dir_override: "" });
@@ -22,6 +23,36 @@ const filter = ref<"all" | "seed" | "fetched" | "read" | "carded">("all");
 let bubbleTimer: number | undefined;
 let pollTimer: number | undefined;
 
+// v0.4：宠物状态机（PetSprite 暴露 poke）+ 右键菜单
+const petSprite = ref<InstanceType<typeof PetSprite> | null>(null);
+const petMood = ref("idle");
+const menuShow = ref(false);
+document.addEventListener("click", () => { menuShow.value = false; });
+function petPoke(mood: "happy" | "eat", ms?: number) {
+  petSprite.value?.poke(mood, ms);
+  petMood.value = mood;
+  window.setTimeout(() => { petMood.value = "idle"; }, ms ?? 1200);
+}
+async function quitApp() {
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const { emit } = await import("@tauri-apps/api/event");
+    await emit("pet-quit", true);  // 任意窗监听，Rust 侧退出
+    getCurrentWindow().destroy().catch(() => {});
+  } catch { window.close(); }
+}
+async function openPanelForSettings() {
+  // 右键菜单的设置：唤起 main 面板窗并切到设置视图（pet 小窗放不下设置页）
+  try {
+    const { getCurrentWindow, Window } = await import("@tauri-apps/api/window");
+    const { emitTo } = await import("@tauri-apps/api/event");
+    const main = await Window.getByLabel("main");
+    if (main) { await main.show(); await main.setFocus(); await emitTo("main", "switch-view", "settings"); }
+    const cur = getCurrentWindow();
+    if (cur.label === "pet") await cur.hide();
+  } catch (e) { showBubble("⚠️ 打开设置失败"); }
+}
+
 const shown = computed(() =>
   filter.value === "all" ? items.value : items.value.filter(i => i.status === filter.value)
 );
@@ -34,6 +65,7 @@ async function refresh() {
 
 // 桌宠单击：收剪贴板
 async function petClick() {
+  petPoke("happy", 1000);
   try {
     let text = "";
     try { text = await readText(); } catch { text = ""; }
@@ -60,6 +92,7 @@ function petDrag(e: PointerEvent) {
 }
 
 async function bowlClick() {
+  petPoke("eat", 1400);
   try {
     let text = "";
     try { text = await readText(); } catch { text = ""; }
@@ -254,12 +287,7 @@ onMounted(async () => {
     moveMsg.value = `🚚 已迁移 ${cur}/${total} 个目录…`;
   });
   onUnmounted(() => unP());
-  const winLabel = await (async () => {
-    try { const { getCurrentWindow } = await import("@tauri-apps/api/window"); return getCurrentWindow().label; }
-    catch { return "main"; }
-  })();
   const un = await listen<string>("switch-view", (e) => {
-    if (winLabel !== "main") return; // 只有面板窗响应切换，桌宠视图永不被动改
     const v = e.payload;
     if (v === "panel" || v === "settings" || v === "pet") view.value = v as any;
   });
@@ -267,7 +295,7 @@ onMounted(async () => {
   try {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const label = getCurrentWindow().label;
-    view.value = label === "pet" ? "pet" : (label === "bowl" ? "bowl" : "panel");
+    view.value = label === "pet" ? "pet" : "panel";
   } catch { view.value = "panel"; }
   cfg.value = await invoke<AiConfig>("get_config");
   refresh();
@@ -329,20 +357,38 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
 </script>
 
 <template>
-  <!-- 桌宠视图 -->
-  <div v-if="view === 'pet'" class="petwrap">
+  <!-- 桌宠视图（v0.4：宠物+食盆同窗，把手拖动，右键菜单） -->
+  <div v-if="view === 'pet'" class="petwrap" :class="`mood-${petMood}`" @contextmenu.prevent="menuShow = true">
     <div v-if="bubbleShow" class="bubble">{{ bubble }}</div>
-    <div class="pet" @click="petClick" @dblclick="openPanel" @pointerdown="petDrag" title="拖动移动 / 单击收藏 / 双击面板">
-      <div class="pet-face">🐱</div>
-      <div class="pet-body"></div>
-    </div>
-    <div class="pet-hint" v-if="st">📥 {{ st.total }} · 待爬 {{ st.queue }}</div>
-  </div>
 
-  <!-- 食盆视图 -->
-  <div v-else-if="view === 'bowl'" class="bowlwrap">
-    <div v-if="bubbleShow" class="bubble">{{ bubble }}</div>
-    <div class="bowl" @click="bowlClick" title="点食盆喂食 = 收藏剪贴板">🍚</div>
+    <!-- 右键菜单 -->
+    <div v-if="menuShow" class="pet-menu" @click.stop>
+      <button @click="menuShow = false; petClick()">📥 收藏剪贴板</button>
+      <button @click="menuShow = false; bowlClick()">🍚 喂食（收进食盆）</button>
+      <button @click="menuShow = false; openPanel()">📚 管理面板</button>
+      <button @click="menuShow = false; openPanelForSettings()">⚙ 设置</button>
+      <button class="danger" @click="menuShow = false; quitApp()">🚪 退出</button>
+    </div>
+
+    <!-- 拖动把手（顶部横条，专用拖动区，不与单击/双击冲突） -->
+    <div class="drag-handle" @pointerdown="petDrag" title="按住拖动整组">
+      <span class="dots">⠿</span>
+    </div>
+
+    <!-- 宠物+食盆横排（同窗联动） -->
+    <div class="petrow">
+      <!-- 宠物（单击=收藏，双击=面板） -->
+      <div class="pet" @click="petClick" @dblclick="openPanel" title="单击收藏 / 双击面板 / 右键菜单 / 顶部横条拖动">
+        <PetSprite ref="petSprite" />
+      </div>
+      <!-- 食盆：有排队内容时冒星 -->
+      <div class="bowl" :class="{ 'has-queue': st && st.queue > 0 }" @click="bowlClick" title="点食盆喂食 = 收藏剪贴板">
+        🍚
+        <span v-if="st && st.queue > 0" class="queue-star">⭐</span>
+      </div>
+    </div>
+
+    <div class="pet-hint" v-if="st">📥 {{ st.total }} · 待爬 {{ st.queue }}</div>
   </div>
 
   <!-- 管理面板 -->
@@ -487,28 +533,37 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); });
 html, body { background: transparent !important; }
 body { font-family: system-ui, "Microsoft YaHei"; overflow: hidden; }
 
-/* 食盆 */
-.bowlwrap { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
-.bowl { font-size: 52px; cursor: pointer; user-select: none; filter: drop-shadow(0 2px 4px rgba(0,0,0,.35)); transition: transform .15s; }
+/* 食盆（同窗） */
+.bowl { font-size: 34px; cursor: pointer; user-select: none; filter: drop-shadow(0 2px 4px rgba(0,0,0,.35)); transition: transform .15s; position: relative; line-height: 1; }
 .bowl:hover { transform: scale(1.12); }
 .bowl:active { transform: scale(0.9); }
+.bowl .queue-star { position: absolute; top: -10px; right: -8px; font-size: 14px; animation: starpop 1.4s ease-in-out infinite; }
+@keyframes starpop { 0%,100% { transform: translateY(0) scale(1); opacity: .7; } 50% { transform: translateY(-4px) scale(1.25); opacity: 1; } }
 /* 进度条 */
 .progwrap { height: 8px; background: #eee; border-radius: 999px; margin: 10px 0 4px; overflow: hidden; }
 .progbar { height: 100%; background: #f97316; border-radius: 999px; transition: width .3s; }
 .rowsep { display: flex; gap: 6px; align-items: center; }
 .rowsep .grow { flex: 1; }
 
-/* 桌宠 */
-.petwrap { width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; }
-.pet { cursor: pointer; text-align: center; user-select: none; transition: transform .15s; }
-.pet:hover { transform: scale(1.1); }
-.pet:active { transform: scale(0.92); }
-.pet-face { font-size: 52px; filter: drop-shadow(0 2px 4px rgba(0,0,0,.35)); }
-.pet-body { width: 46px; height: 8px; background: rgba(0,0,0,.18); border-radius: 50%; margin: 2px auto 0; }
+/* 桌宠（v0.4：横排布局 宠物+食盆，把手在顶部） */
+.petwrap { width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; padding-top: 18px; }
+.petwrap .pet { cursor: pointer; user-select: none; transition: transform .15s; }
+.petwrap .pet:hover { transform: scale(1.05); }
+.drag-handle { position: absolute; top: 0; left: 0; right: 0; height: 18px; display: flex; align-items: center; justify-content: center; cursor: grab; background: rgba(255,255,255,.08); border-radius: 10px 10px 0 0; opacity: 0; transition: opacity .15s; }
+.petwrap:hover .drag-handle { opacity: 1; }
+.drag-handle:active { cursor: grabbing; background: rgba(255,255,255,.18); }
+.drag-handle .dots { font-size: 12px; color: rgba(255,255,255,.75); line-height: 1; }
+.petrow { display: flex; align-items: flex-end; gap: 6px; }
+/* 右键菜单 */
+.pet-menu { position: absolute; top: 22px; left: 10px; z-index: 50; background: #fff; border-radius: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.3); padding: 6px; display: flex; flex-direction: column; min-width: 150px; }
+.pet-menu button { border: 0; background: none; text-align: left; padding: 8px 12px; font-size: 13px; border-radius: 8px; cursor: pointer; color: #333; }
+.pet-menu button:hover { background: #fff1e6; }
+.pet-menu button.danger { color: #b91c1c; }
 .bubble {
-  position: absolute; top: -6px; left: 50%; transform: translateX(-50%);
+  position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
   background: #fff; color: #333; border-radius: 12px; padding: 8px 14px;
   font-size: 13px; white-space: nowrap; box-shadow: 0 3px 10px rgba(0,0,0,.25);
+  max-width: 96vw; overflow: hidden; text-overflow: ellipsis; z-index: 60;
 }
 .bubble::after {
   content: ""; position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%);

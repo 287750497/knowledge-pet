@@ -72,6 +72,17 @@ fn save_config(kb: &PathBuf, c: &AiConfig) {
     let _ = fs::write(kb.join(".pet-config.json"), serde_json::to_string_pretty(c).unwrap());
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct WinPos { pub x: i32, pub y: i32 }
+
+fn load_win_pos(kb: &PathBuf) -> Option<WinPos> {
+    fs::read_to_string(kb.join(".pet-window.json")).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+fn save_win_pos(kb: &PathBuf, p: &WinPos) {
+    let _ = fs::write(kb.join(".pet-window.json"), serde_json::to_string(p).unwrap());
+}
+
 fn chrono_today() -> String {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 8 * 3600;
     let (y, m, d) = civil_from_days((t / 86400) as i64);
@@ -556,6 +567,26 @@ pub fn run() {
                         handle.exit(0);
                     }
                 });
+            }
+            // pet 窗口：启动恢复上次位置；移动结束（拖完松手）保存位置
+            if let Some(pet) = app.get_webview_window("pet") {
+                let kb = app.handle().state::<PetState>().kb_dir.lock().unwrap().clone();
+                if let Some(pos) = load_win_pos(&kb) {
+                    let _ = pet.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
+                }
+                let handle2 = app.handle().clone();
+                pet.on_window_event(move |ev| {
+                    if let tauri::WindowEvent::Moved(pos) = ev {
+                        let kb = handle2.state::<PetState>().kb_dir.lock().unwrap().clone();
+                        save_win_pos(&kb, &WinPos { x: pos.x, y: pos.y });
+                    }
+                });
+            }
+            // 右键菜单「退出」：前端 emit pet-quit → 整个应用退出
+            {
+                use tauri::Listener;
+                let h3 = app.handle().clone();
+                app.listen("pet-quit", move |_ev| { h3.exit(0); });
             }
             Ok(())
         })
