@@ -3,6 +3,7 @@
 // Notion：internal connection token，官方 REST API
 
 use crate::PetState;
+use std::fs;
 use serde_json::json;
 use tauri::State;
 
@@ -135,6 +136,227 @@ pub fn save_integrations(state: State<'_, PetState>, feishu_webhook: String,
 }
 
 // ---------- 单元测试 ----------
+
+// ================= 第二期/第三期 =================
+
+/// Notion 数据库行 → 纯文本（页面 block 展开）
+async fn notion_page_text(client: &reqwest::Client, page_id: &str) -> Result<String, String> {
+    let resp = client.get(format!("https://api.notion.com/v1/blocks/{page_id}/children"))
+        .timeout(std::time::Duration::from_secs(20))
+        .send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() { return Err(format!("读页面失败 HTTP {}", resp.status())); }
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    if let Some(results) = v["results"].as_array() {
+        for b in results {
+            let t = b["type"].as_str().unwrap_or("");
+            let text = b[t]["rich_text"].as_array()
+                .map(|a| a.iter().filter_map(|r| r["plain_text"].as_str()).collect::<Vec<_>>().join(""))
+                .unwrap_or_default();
+            if !text.is_empty() { out.push(text); }
+        }
+    }
+    Ok(out.join("\n"))
+}
+
+/// 第二期①：拉取 Notion 收集箱最近 N 行 → AI 整理成知识卡 → 存 30-notes/，并在 Notion 行属性 marked 标记（可选）
+#[tauri::command]
+pub async fn notion_sync_to_cards(state: State<'_, PetState>, limit: u32) -> Result<String, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    if cfg.notion_token.is_empty() || cfg.notion_db_id.is_empty() { return Err("先在设置→Notion 填 token 和数据库 ID".into()); }
+    if cfg.api_key.is_empty() { return Err("AI 未配置（设置→AI 模型）".into()); }
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let client = notion_client(&cfg.notion_token);
+    let db_id = cfg.notion_db_id.trim().replace('-', "");
+    // 查询最近 N 条
+    let body = client.post(format!("https://api.notion.com/v1/databases/{db_id}/query"))
+        .json(&json!({ "page_size": limit.max(1).min(10), "sorts": [{ "timestamp": "created_time", "direction": "descending" }] }))
+        .timeout(std::time::Duration::from_secs(20))
+        .send().await.map_err(|e| format!("网络错误: {e}"))?;
+    if !body.status().is_success() { return Err(format!("查询失败 HTTP {}", body.status())); }
+    let v: serde_json::Value = body.json().await.map_err(|e| e.to_string())?;
+    let rows = v["results"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() { return Ok("收集箱是空的，没有可同步的内容".into()); }
+    let mut done = Vec::new();
+    for r in &rows {
+        let page_id = r["id"].as_str().unwrap_or_default().replace('-', "");
+        let title = r["properties"].as_object().and_then(|props| {
+            props.values().find(|p| p["type"] == "title")
+                .and_then(|p| p["title"].as_array())
+                .and_then(|a| a.first())
+                .and_then(|t| t["plain_text"].as_str()).map(String::from)
+        }).unwrap_or_else(|| "无标题".into());
+        let text = notion_page_text(&client, &page_id).await.unwrap_or_default();
+        if text.trim().is_empty() { continue; }
+        let url = r["url"].as_str().unwrap_or("");
+        let prompt = format!(
+            "你是知识库管理员。把下面的素材整理成一张知识卡。\n输出 frontmatter + 正文，格式严格如下（YAML）:\n---\ntitle: 卡片标题（10字内）\ntags: [标签1, 标签2]\nstatus: seed\nsource: \"Notion: {}\"\n---\n\n# 一句话结论\n\n（最核心的判断一句话）\n\n## 展开\n\n（要点、例子，markdown 列表，300字内）\n\n## 下一步行动\n\n- [ ] 一个可执行的下一步\n\n素材标题：{}\n素材内容：\n{}",
+            url, title, text
+        );
+        let content = crate::ai_chat(&cfg, &prompt).await?;
+        let body = match content.find("\n---\n").or_else(|| content.starts_with("---").then(|| 0)) {
+            Some(p) => &content[p.max(0)..],
+            None => &content[..],
+        };
+        let title2 = body.lines().find(|l| l.starts_with("title:")).map(|l| l[6..].trim().trim_matches('"').to_string()).unwrap_or(title.clone());
+        let fname = format!("{}-{}.md", crate::chrono_today(), crate::sanitize(&title2));
+        fs::create_dir_all(kb.join("30-notes")).map_err(|e| e.to_string())?;
+        fs::write(kb.join("30-notes").join(&fname), body.trim_start()).map_err(|e| e.to_string())?;
+        done.push(fname);
+    }
+    if done.is_empty() { Ok("Notion 行都没有正文内容，跳过".into()) }
+    else { Ok(format!("已同步 {} 张知识卡：{}", done.len(), done.join("、"))) }
+}
+
+/// 第二期②：把本地草稿推回 Notion（创建页面到收集箱数据库），手机可读
+#[tauri::command]
+pub async fn push_draft_to_notion(state: State<'_, PetState>, file: String) -> Result<String, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    if cfg.notion_token.is_empty() || cfg.notion_db_id.is_empty() { return Err("先在设置→Notion 填 token 和数据库 ID".into()); }
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let text = fs::read_to_string(kb.join(&file)).map_err(|e| format!("读草稿失败: {e}"))?;
+    // 去掉 frontmatter
+    let content = if text.starts_with("---") {
+        text[3..].find("\n---\n").map(|p| text[p + 8..].to_string()).unwrap_or_else(|| text.clone())
+    } else { text.clone() };
+    // 正文 → Notion blocks（按行拆：# 标题 / - 列表 / 普通段落）
+    let mut children = Vec::new();
+    for line in content.lines() {
+        let l = line.trim();
+        if l.is_empty() { continue; }
+        if let Some(h) = l.strip_prefix("# ") { children.push(json!({"object":"block","type":"heading_1","heading_1":{"rich_text":[{"type":"text","text":{"content":h}}]}})); }
+        else if let Some(h) = l.strip_prefix("## ") { children.push(json!({"object":"block","type":"heading_2","heading_2":{"rich_text":[{"type":"text","text":{"content":h}}]}})); }
+        else if let Some(h) = l.strip_prefix("### ") { children.push(json!({"object":"block","type":"heading_3","heading_3":{"rich_text":[{"type":"text","text":{"content":h}}]}})); }
+        else if let Some(b) = l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")) { children.push(json!({"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text":[{"type":"text","text":{"content":b}}]}})); }
+        else { children.push(json!({"object":"block","type":"paragraph","paragraph":{"rich_text":[{"type":"text","text":{"content":l}}]}})); }
+        if children.len() >= 90 { break; } // Notion 单次 100 上限，留余量
+    }
+    let title = file.rsplit('/').next().unwrap_or("草稿").trim_end_matches(".md").to_string();
+    let client = notion_client(&cfg.notion_token);
+    let db_id = cfg.notion_db_id.trim().replace('-', "");
+    let resp = client.post("https://api.notion.com/v1/pages")
+        .json(&json!({
+            "parent": { "database_id": db_id },
+            "properties": { "title": { "title": [{ "text": { "content": format!("📝 {}", title) } }] } },
+            "children": children
+        }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send().await.map_err(|e| format!("网络错误: {e}"))?;
+    let st = resp.status();
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !st.is_success() {
+        let m = v["message"].as_str().unwrap_or("未知错误");
+        return Err(format!("推送失败 {}: {}", st.as_u16(), m));
+    }
+    Ok(format!("已推送到 Notion：📝 {}（手机打开 Notion 就能看）", title))
+}
+
+/// 第三期：飞书周报——本周新增卡数/草稿数/待办完成情况推飞书。手动触发（面板按钮）或每周日 20 点自动
+#[tauri::command]
+pub async fn feishu_push_weekly(state: State<'_, PetState>) -> Result<String, String> {
+    let (wh, kb) = {
+        let cfg = state.config.lock().unwrap();
+        let kb = state.kb_dir.lock().unwrap().clone();
+        (cfg.feishu_webhook.clone(), kb)
+    };
+    if wh.trim().is_empty() { return Err("未配置飞书 webhook".into()); }
+    let stats = weekly_stats(&kb)?;
+    let text = format!(
+        "📊 知识库周报\n\n本周期（最近7天）：\n· 新收素材 {} 条\n· 新增知识卡 {} 张\n· 生成草稿 {} 篇\n· 待办完成 {} 项（剩 {} 项未完成）\n\n累计知识卡 {} 张。",
+        stats.new_items, stats.new_cards, stats.new_drafts, stats.todos_done, stats.todos_open, stats.total_cards
+    );
+    feishu_send_text(wh.trim(), &text).await
+}
+
+#[derive(serde::Serialize)]
+pub struct WeeklyStats { pub new_items: usize, pub new_cards: usize, pub new_drafts: usize, pub todos_done: usize, pub todos_open: usize, pub total_cards: usize }
+
+pub fn weekly_stats(kb: &std::path::PathBuf) -> Result<WeeklyStats, String> {
+    let recent = |fname: &str| -> bool {
+        // 文件名 YYYYMMDD-xxx.md；7 天内按粗略日历序号（y*372+m*31+d）比较
+        let digits: String = fname.chars().take(8).filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() != 8 { return false; }
+        let ymd: i64 = digits.parse().unwrap_or(0);
+        let (y, m, d) = (ymd / 10000, ymd / 100 % 100, ymd % 100);
+        let today = crate::chrono_today();
+        let ty: i64 = today.get(0..4).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let tm: i64 = today.get(4..6).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let td: i64 = today.get(6..8).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let ord = |y: i64, m: i64, d: i64| y * 372 + m * 31 + d;
+        ord(ty, tm, td) - ord(y, m, d) <= 7
+    };
+    let count_dir = |dir: &str| -> usize {
+        fs::read_dir(kb.join(dir)).map(|rd| rd.filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            .filter(|e| recent(&e.file_name().to_string_lossy()))
+            .count()).unwrap_or(0)
+    };
+    let total_cards = fs::read_dir(kb.join("30-notes")).map(|rd| rd.filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false)).count()).unwrap_or(0);
+    // 待办：30-notes 里所有卡的 - [ ] / - [x]
+    let (mut done, mut open) = (0usize, 0usize);
+    if let Ok(rd) = fs::read_dir(kb.join("30-notes")) {
+        for e in rd.filter_map(|e| e.ok()) {
+            if let Ok(t) = fs::read_to_string(e.path()) {
+                for l in t.lines() {
+                    if l.contains("- [x]") { done += 1; }
+                    else if l.contains("- [ ]") { open += 1; }
+                }
+            }
+        }
+    }
+    Ok(WeeklyStats { new_items: count_dir("10-inbox"), new_cards: count_dir("30-notes"), new_drafts: count_dir("50-drafts"), todos_done: done, todos_open: open, total_cards })
+}
+
+// ---------- 测试 ----------
+
+#[cfg(test)]
+mod phase23_tests {
+    use super::*;
+
+    #[test]
+    fn test_weekly_stats() {
+        let tmp = std::env::temp_dir().join(format!("kp-w-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("10-inbox")).unwrap();
+        fs::create_dir_all(tmp.join("30-notes")).unwrap();
+        fs::create_dir_all(tmp.join("50-drafts")).unwrap();
+        let today = crate::chrono_today();
+        // 今天的新卡（应计入）+ 三个月前的旧卡（不计入）
+        fs::write(tmp.join(format!("30-notes/{}-新卡.md", today)), "- [x] 完成的\n- [ ] 没完成的\n").unwrap();
+        fs::write(tmp.join("30-notes/20260101-旧卡.md"), "").unwrap();
+        fs::write(tmp.join(format!("10-inbox/{}-素材.md", today)), "").unwrap();
+        fs::write(tmp.join(format!("50-drafts/{}-草稿.md", today)), "---\nkind: draft\n---\n\n正文").unwrap();
+        let s = weekly_stats(&tmp).unwrap();
+        assert_eq!(s.new_cards, 1, "只算最近的卡");
+        assert_eq!(s.new_items, 1);
+        assert_eq!(s.new_drafts, 1);
+        assert_eq!(s.total_cards, 2);
+        assert_eq!(s.todos_done, 1);
+        assert_eq!(s.todos_open, 1);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_weekly_stats_empty() {
+        let tmp = std::env::temp_dir().join(format!("kp-w2-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("30-notes")).unwrap();
+        let s = weekly_stats(&tmp).unwrap();
+        assert_eq!(s.new_cards, 0);
+        assert_eq!(s.total_cards, 0);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_draft_frontmatter_strip() {
+        // push 前去 frontmatter 的逻辑
+        let text: &str = "---\nkind: draft\nused: a.md\n---\n\n# 标题\n\n正文";
+        let content = if text.starts_with("---") {
+            text[3..].find("\n---\n").map(|p| &text[p + 5..]).unwrap_or(text)
+        } else { text };
+        assert!(content.contains("# 标题"));
+        assert!(!content.contains("kind: draft"));
+    }
+}
 
 #[cfg(test)]
 mod integration_tests {

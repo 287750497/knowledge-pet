@@ -528,7 +528,9 @@ pub fn run() {
             list_cards, quote_create, list_drafts, gen_topics, daily_review,
             integrations::feishu_test, integrations::feishu_push_daily,
             integrations::notion_test, integrations::notion_preview,
-            integrations::save_integrations
+            integrations::save_integrations,
+            integrations::notion_sync_to_cards, integrations::push_draft_to_notion,
+            integrations::feishu_push_weekly
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
@@ -573,12 +575,20 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
-            // main / pet 窗口点关闭 = 退出进程
+            // main 面板点 X / 最小化到关闭 = 回到桌宠（隐藏面板 + 显示宠物），退出走托盘菜单
             let handle = app.handle().clone();
             if let Some(w) = app.get_webview_window("main") {
                 w.on_window_event(move |ev| {
-                    if let tauri::WindowEvent::CloseRequested { .. } = ev {
-                        handle.exit(0);
+                    match ev {
+                        // 点 X = 回到桌宠（隐藏面板+亮出宠物），退出走托盘菜单
+                        tauri::WindowEvent::CloseRequested { .. } => {
+                            if let Some(pet) = handle.get_webview_window("pet") {
+                                let _ = pet.show();
+                                let _ = pet.set_focus();
+                            }
+                            let _ = handle.get_webview_window("main").map(|m| m.hide());
+                        }
+                        _ => {}
                     }
                 });
             }

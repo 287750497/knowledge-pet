@@ -40,18 +40,18 @@ const tailDur = computed(() => mood.value === "sleep" ? "0s" : "1.6s");
   <svg class="pet-svg" viewBox="0 0 120 110" width="110" height="100" aria-hidden="true">
     <defs>
       <radialGradient id="bodyG" cx="40%" cy="30%" r="80%">
-        <stop offset="0%" stop-color="#ffe9c9"/>
-        <stop offset="100%" stop-color="#f4b96a"/>
+        <stop offset="0%" stop-color="#fdeedd"/>
+        <stop offset="100%" stop-color="#eeb47c"/>
       </radialGradient>
       <linearGradient id="earG" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#ffd9a0"/>
-        <stop offset="100%" stop-color="#e59a45"/>
+        <stop offset="0%" stop-color="#f7dcb4"/>
+        <stop offset="100%" stop-color="#dd9a5b"/>
       </linearGradient>
     </defs>
 
     <!-- 尾巴（摆动动画） -->
     <path class="tail" d="M96 82 Q116 76 112 58 Q110 50 104 54"
-      fill="none" stroke="#e59a45" stroke-width="7" stroke-linecap="round"
+      fill="none" stroke="#d99a5e" stroke-width="7" stroke-linecap="round"
       :style="{ animation: tailDur ? `tailswing ${tailDur} ease-in-out infinite alternate` : 'none' }"/>
 
     <!-- 身体 -->
@@ -119,8 +119,10 @@ const tailDur = computed(() => mood.value === "sleep" ? "0s" : "1.6s");
 .pet-svg .zzz1 { animation: zfloat 2.2s ease-in-out infinite alternate; }
 .pet-svg .zzz2 { animation: zfloat 2.2s .6s ease-in-out infinite alternate; }
 @keyframes zfloat { from { opacity: .3; transform: translateY(0); } to { opacity: 1; transform: translateY(-3px); } }
-/* 整体呼吸感 */
-.petwrap .pet-svg { animation: petbreathe 3s ease-in-out infinite; }
+/* 呼吸感：更克制（hallmark: motion has a job——呼吸=活着的最小信号） */
+.petwrap .pet-svg { animation: petbreathe 3.6s ease-in-out infinite; }
 .petwrap.mood-sleep .pet-svg { animation: none; }
-@keyframes petbreathe { 0%,100% { transform: scale(1); } 50% { transform: scale(1.03); } }
+@keyframes petbreathe { 0%,100% { transform: scale(1); } 50% { transform: scale(1.015); } }
+/* 拖拽中：轻微放大+长影（grabbing 反馈） */
+.petwrap.dragging .pet-svg { transform: scale(1.06); filter: drop-shadow(0 10px 14px rgba(0,0,0,.28)); }
 </style>

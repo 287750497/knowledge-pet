@@ -22,7 +22,8 @@
         "transparent": true,
         "alwaysOnTop": true,
         "skipTaskbar": true,
-        "resizable": false
+        "resizable": false,
+        "shadow": false
       },
       {
         "label": "main",
@@ -30,7 +31,9 @@
         "width": 760,
         "height": 560,
         "visible": false,
-        "resizable": true
+        "resizable": true,
+        "minWidth": 420,
+        "minHeight": 480
       }
     ],
     "security": {

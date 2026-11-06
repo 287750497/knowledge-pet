@@ -20,6 +20,11 @@
     "global-shortcut:allow-is-registered",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
-    "shell:allow-open"
+    "shell:allow-open",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-start-dragging",
+    "core:window:allow-outer-position",
+    "core:window:allow-outer-size",
+    "core:window:allow-cursor-position"
   ]
 }
