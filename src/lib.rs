@@ -547,7 +547,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(PetState { kb_dir: Mutex::new(kb), config: Mutex::new(cfg), queue: Mutex::new(Vec::new()) })
         .invoke_handler(tauri::generate_handler![
-            list_items, capture, process_queue, ai_make_card, mark_read, delete_item,
+            list_items, capture, process_queue, ai_make_card, mark_read, delete_item, fetch_models,
             get_config, set_config, move_kb_dir, list_bookmarks, add_bookmark, remove_bookmark,
             stats, bubble, open_kb, read_clipboard_text,
             list_cards, quote_create, list_drafts, gen_topics, daily_review,
@@ -707,6 +707,26 @@ fn scan_cards(kb: &PathBuf) -> Vec<CardItem> {
         });
     }
     out
+}
+
+#[tauri::command]
+async fn fetch_models(state: State<'_, PetState>) -> Result<Vec<String>, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    let base = cfg.base_url.clone();
+    let key = cfg.api_key.clone();
+    if base.trim().is_empty() { return Err("请先填 API 地址".into()); }
+    let cli = reqwest::Client::new();
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    let mut req = cli.get(&url);
+    if !key.trim().is_empty() { req = req.bearer_auth(key.trim()); }
+    let resp = req.send().await.map_err(|e| format!("请求失败：{}", e))?;
+    let j: serde_json::Value = resp.json().await.map_err(|e| format!("返回异常：{}", e))?;
+    let mut out: Vec<String> = j["data"].as_array()
+        .map(|a| a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    out.sort();
+    if out.is_empty() { return Err(format!("接口没返回模型列表：{}", serde_json::to_string(&j).unwrap_or_default().chars().take(150).collect::<String>())); }
+    Ok(out)
 }
 
 #[tauri::command]

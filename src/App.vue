@@ -300,6 +300,25 @@ async function testConfig() {
 
 // ---- 设置页标签 ----
 const setTab = ref<"general" | "ai" | "notion" | "feishu">("ai");
+const modelsList = ref<string[]>([]);
+const modelsBusy = ref(false);
+const modelsMsg = ref("");
+async function fetchModels() {
+  modelsBusy.value = true; modelsMsg.value = ""; modelsList.value = [];
+  try {
+    if (!cfg.value.base_url.trim()) { modelsMsg.value = "先填 API 地址并保存，再获取模型"; return; }
+    // 先保存当前填写的地址/Key，保证后端拿到最新值
+    await invoke("set_config", {
+      baseUrl: cfg.value.base_url, apiKey: cfg.value.api_key, model: cfg.value.model,
+      promptArticle: cfg.value.prompt_article ?? "", promptWechat: cfg.value.prompt_wechat ?? "",
+      promptQuote: cfg.value.prompt_quote ?? "", promptTopics: cfg.value.prompt_topics ?? "",
+      promptDaily: cfg.value.prompt_daily ?? "",
+    });
+    modelsList.value = await invoke<string[]>("fetch_models");
+    if (!modelsList.value.length) modelsMsg.value = "接口没返回模型";
+  } catch (e) { modelsMsg.value = "❌ " + String(e).slice(0, 160); }
+  modelsBusy.value = false;
+}
 const itgMsg = ref("");
 
 // ---- 微信文章采集（借鉴 wechat-url-capture）----
@@ -787,7 +806,14 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <label>API Key</label>
       <input v-model="cfg.api_key" type="password" placeholder="sk-..." />
       <label>模型名</label>
-      <input v-model="cfg.model" placeholder="gpt-4o-mini / deepseek-chat / agnes-chat …" />
+      <div class="rowsep">
+        <input v-model="cfg.model" placeholder="gpt-4o-mini / deepseek-chat / agnes-chat …" class="grow" />
+        <button type="button" class="mini" :disabled="modelsBusy" @click="fetchModels">{{ modelsBusy ? "获取中…" : "⟳ 获取模型" }}</button>
+      </div>
+      <div v-if="modelsList.length" class="modellist">
+        <div v-for="m in modelsList" :key="m" class="modelitem" @click="cfg.model = m; modelsList = []">{{ m }}</div>
+      </div>
+      <p v-if="modelsMsg" class="mut" style="font-size:12px;margin:4px 0">{{ modelsMsg }}</p>
       <p class="tip">填 OpenAI 兼容接口即可（chat/completions）。AI 整理知识卡会走这里。</p>
       <h3 class="sect">🎛️ 成卡/创作预设（AI 提示词模板）</h3>
       <p class="tip">每类内容用专属模板；留空 = 用内置默认。占位符会被自动替换。</p>
@@ -1049,4 +1075,8 @@ form > .sect:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
 /* 表单主按钮（保存） */
 form .ok, .cfgform .ok { background: #07C160; border-color: #07C160; color: #fff; }
 form .ok:hover, .cfgform .ok:hover { background: #06AD56; }
+/* 获取模型弹层 */
+.modellist { max-height: 180px; overflow-y: auto; border: 1px solid #d9dce3; border-radius: 8px; background: #fff; margin-top: 4px; box-shadow: 0 4px 14px rgba(0,0,0,.08); }
+.modelitem { padding: 6px 10px; font-size: 12px; cursor: pointer; border-bottom: 1px solid #f0f1f4; }
+.modelitem:hover { background: #e8f9ef; color: #07C160; }
 </style>
