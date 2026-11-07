@@ -22,6 +22,20 @@ pub struct Item {
     pub error: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct ProviderCfg {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub image_model: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AiConfig {
     pub base_url: String,
@@ -51,13 +65,22 @@ pub struct AiConfig {
     pub prompt_topics: String,    // 跨卡选题模板 {digest}
     #[serde(default)]
     pub prompt_daily: String,     // 每日冒泡文案模板 {date} {title} {conclusion} {todos}
+    // ---- 多厂商模型配置（v0.9.5：厂商卡片+文本/图片模型分组）----
+    #[serde(default)]
+    pub providers: Vec<ProviderCfg>,
+    #[serde(default)]
+    pub active_provider: usize,
+    #[serde(default)]
+    pub image_provider: i64,
+    #[serde(default)]
+    pub image_model: String,
 }
 
 fn default_hotkey() -> String { "Ctrl+Alt+C".into() }
 
 impl Default for AiConfig {
     fn default() -> Self {
-        AiConfig { base_url: String::new(), api_key: String::new(), model: String::new(), hotkey: default_hotkey(), kb_dir_override: String::new(), feishu_webhook: String::new(), feishu_push_daily: false, notion_token: String::new(), notion_db_id: String::new(), prompt_article: String::new(), prompt_wechat: String::new(), prompt_quote: String::new(), prompt_topics: String::new(), prompt_daily: String::new() }
+        AiConfig { base_url: String::new(), api_key: String::new(), model: String::new(), hotkey: default_hotkey(), kb_dir_override: String::new(), feishu_webhook: String::new(), feishu_push_daily: false, notion_token: String::new(), notion_db_id: String::new(), prompt_article: String::new(), prompt_wechat: String::new(), prompt_quote: String::new(), prompt_topics: String::new(), prompt_daily: String::new(), providers: Vec::new(), active_provider: 0, image_provider: -1, image_model: String::new() }
     }
 }
 
@@ -87,9 +110,31 @@ fn now_id() -> String {
 }
 
 fn load_config(kb: &PathBuf) -> AiConfig {
-    fs::read_to_string(kb.join(".pet-config.json")).ok()
+    let mut c: AiConfig = fs::read_to_string(kb.join(".pet-config.json")).ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 旧单组配置 → 迁移成第一个厂商（无缝升级）
+    if c.providers.is_empty() && (!c.base_url.is_empty() || !c.api_key.is_empty()) {
+        c.providers.push(ProviderCfg {
+            name: "默认厂商".into(),
+            base_url: c.base_url.clone(),
+            api_key: c.api_key.clone(),
+            model: c.model.clone(),
+            image_model: String::new(),
+        });
+    }
+    if c.active_provider >= c.providers.len() { c.active_provider = 0; }
+    if c.image_provider >= c.providers.len() as i64 { c.image_provider = -1; }
+    c
+}
+
+/// 当前生效的文本模型厂商配置（providers 空=旧字段）
+pub fn active_cfg(cfg: &AiConfig) -> (&String, &String, &String) {
+    if let Some(p) = cfg.providers.get(cfg.active_provider) {
+        (&p.base_url, &p.api_key, &p.model)
+    } else {
+        (&cfg.base_url, &cfg.api_key, &cfg.model)
+    }
 }
 
 fn save_config(kb: &PathBuf, c: &AiConfig) {
@@ -417,7 +462,9 @@ fn get_config(state: State<PetState>) -> AiConfig { state.config.lock().unwrap()
 #[tauri::command]
 fn set_config(state: State<PetState>, base_url: String, api_key: String, model: String, hotkey: Option<String>,
     prompt_article: Option<String>, prompt_wechat: Option<String>, prompt_quote: Option<String>,
-    prompt_topics: Option<String>, prompt_daily: Option<String>) {
+    prompt_topics: Option<String>, prompt_daily: Option<String>,
+    providers: Option<Vec<ProviderCfg>>, active_provider: Option<usize>,
+    image_provider: Option<i64>, image_model: Option<String>) {
     let mut c = state.config.lock().unwrap();
     c.base_url = base_url; c.api_key = api_key; c.model = model;
     if let Some(h) = hotkey { if !h.trim().is_empty() { c.hotkey = h.trim().to_string(); } }
@@ -427,6 +474,15 @@ fn set_config(state: State<PetState>, base_url: String, api_key: String, model: 
     if let Some(t) = prompt_quote { c.prompt_quote = t; }
     if let Some(t) = prompt_topics { c.prompt_topics = t; }
     if let Some(t) = prompt_daily { c.prompt_daily = t; }
+    // 多厂商：传 None=不改
+    if let Some(ps) = providers { c.providers = ps; }
+    if let Some(i) = active_provider { if i < c.providers.len().max(1) { c.active_provider = i; } }
+    if let Some(i) = image_provider { c.image_provider = i; }
+    if let Some(m) = image_model { c.image_model = m; }
+    // providers 有值时把文本厂商的值回写旧字段（兼容所有旧调用点）
+    if let Some(p) = c.providers.get(c.active_provider).cloned() {
+        c.base_url = p.base_url; c.api_key = p.api_key; c.model = p.model;
+    }
     let kb = state.kb_dir.lock().unwrap().clone();
     save_config(&kb, &c);
 }
@@ -709,11 +765,15 @@ fn scan_cards(kb: &PathBuf) -> Vec<CardItem> {
     out
 }
 
+/// 拉取厂商模型列表；provider_index=None=用文本厂商（或旧字段）。返回 "id|kind"（kind: text|image）。
 #[tauri::command]
-async fn fetch_models(state: State<'_, PetState>) -> Result<Vec<String>, String> {
+async fn fetch_models(state: State<'_, PetState>, provider_index: Option<i64>) -> Result<Vec<String>, String> {
     let cfg = state.config.lock().unwrap().clone();
-    let base = cfg.base_url.clone();
-    let key = cfg.api_key.clone();
+    let idx = provider_index.map(|i| if i < 0 { cfg.active_provider } else { i as usize });
+    let (base, key) = match idx.and_then(|i| cfg.providers.get(i)) {
+        Some(p) => (p.base_url.clone(), p.api_key.clone()),
+        None => { let (b, k, _) = active_cfg(&cfg); (b.clone(), k.clone()) }
+    };
     if base.trim().is_empty() { return Err("请先填 API 地址".into()); }
     let cli = reqwest::Client::new();
     let url = format!("{}/models", base.trim_end_matches('/'));
@@ -726,7 +786,13 @@ async fn fetch_models(state: State<'_, PetState>) -> Result<Vec<String>, String>
         .unwrap_or_default();
     out.sort();
     if out.is_empty() { return Err(format!("接口没返回模型列表：{}", serde_json::to_string(&j).unwrap_or_default().chars().take(150).collect::<String>())); }
-    Ok(out)
+    // 启发式标记：图片模型 🖼️image / 文本 📝text
+    let img_kw = ["image", "vision", "dall", "flux", "sd", "stable", "diffusion", "imagen", "seedream", "cogview", "wanx"];
+    Ok(out.into_iter().map(|id| {
+        let lower = id.to_lowercase();
+        let kind = if img_kw.iter().any(|k| lower.contains(k)) { "image" } else { "text" };
+        format!("{}|{}", id, kind)
+    }).collect())
 }
 
 #[tauri::command]

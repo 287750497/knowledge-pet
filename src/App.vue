@@ -7,6 +7,7 @@ import PetSprite from "./components/PetSprite.vue";
 interface Item { id: string; file: string; title: string; kind: string; url: string; status: string; created_at: string; error: string }
 interface AiConfig { base_url: string; api_key: string; model: string; hotkey: string; kb_dir_override: string;
   prompt_article?: string; prompt_wechat?: string; prompt_quote?: string; prompt_topics?: string; prompt_daily?: string;
+  providers: ProviderCfg[]; active_provider: number; image_provider: number; image_model: string;
   feishu_webhook: string; feishu_push_daily: boolean; notion_token: string; notion_db_id: string }
 interface Bookmark { title: string; url: string }
 interface Stats { total: number; seed: number; fetched: number; "fetch-failed": number; read: number; carded: number; queue: number; notes: number }
@@ -20,7 +21,8 @@ watch(view, (v) => {
 });
 const items = ref<Item[]>([]);
 const st = ref<Stats | null>(null);
-const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+Alt+C", kb_dir_override: "", prompt_article: "", prompt_wechat: "", prompt_quote: "", prompt_topics: "", prompt_daily: "", feishu_webhook: "", feishu_push_daily: false, notion_token: "", notion_db_id: "" });
+const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+Alt+C", kb_dir_override: "", prompt_article: "", prompt_wechat: "", prompt_quote: "", prompt_topics: "", prompt_daily: "",
+  providers: [], active_provider: 0, image_provider: -1, image_model: "", feishu_webhook: "", feishu_push_daily: false, notion_token: "", notion_db_id: "" });
 const bookmarks = ref<Bookmark[]>([]);
 const bmNew = ref({ title: "", url: "" });
 const kbNew = ref("");
@@ -277,6 +279,10 @@ async function saveConfig() {
     promptQuote: cfg.value.prompt_quote ?? "",
     promptTopics: cfg.value.prompt_topics ?? "",
     promptDaily: cfg.value.prompt_daily ?? "",
+    providers: cfg.value.providers,
+    activeProvider: cfg.value.active_provider,
+    imageProvider: cfg.value.image_provider,
+    imageModel: cfg.value.image_model,
   });
   showBubble("✓ 设置已保存");
   view.value = "panel";
@@ -300,21 +306,38 @@ async function testConfig() {
 
 // ---- 设置页标签 ----
 const setTab = ref<"general" | "ai" | "notion" | "feishu">("ai");
-const modelsList = ref<string[]>([]);
+interface ModelEntry { id: string; kind: string }
+const modelsList = ref<ModelEntry[]>([]);
 const modelsBusy = ref(false);
 const modelsMsg = ref("");
-async function fetchModels() {
+const openProv = ref(-1);
+interface ProviderCfg { name: string; base_url: string; api_key: string; model: string; image_model: string }
+function addProvider() {
+  cfg.value.providers.push({ name: "", base_url: "", api_key: "", model: "", image_model: "" });
+  openProv.value = cfg.value.providers.length - 1;
+}
+function delProvider(pi: number) {
+  cfg.value.providers.splice(pi, 1);
+  if (cfg.value.active_provider >= cfg.value.providers.length) cfg.value.active_provider = 0;
+  if (cfg.value.image_provider === pi) cfg.value.image_provider = -1;
+}
+function pickModel(pi: number, mm: ModelEntry) {
+  const p = cfg.value.providers[pi];
+  if (mm.kind === "image") { p.image_model = mm.id; cfg.value.image_provider = pi; cfg.value.image_model = mm.id; }
+  else { p.model = mm.id; cfg.value.active_provider = pi; }
+  modelsList.value = [];
+}
+const curTextModel = computed(() => cfg.value.providers[cfg.value.active_provider]?.model || cfg.value.model || "");
+const curImageModel = computed(() => cfg.value.image_model || "");
+async function fetchModels(pi: number) {
   modelsBusy.value = true; modelsMsg.value = ""; modelsList.value = [];
   try {
-    if (!cfg.value.base_url.trim()) { modelsMsg.value = "先填 API 地址并保存，再获取模型"; return; }
-    // 先保存当前填写的地址/Key，保证后端拿到最新值
-    await invoke("set_config", {
-      baseUrl: cfg.value.base_url, apiKey: cfg.value.api_key, model: cfg.value.model,
-      promptArticle: cfg.value.prompt_article ?? "", promptWechat: cfg.value.prompt_wechat ?? "",
-      promptQuote: cfg.value.prompt_quote ?? "", promptTopics: cfg.value.prompt_topics ?? "",
-      promptDaily: cfg.value.prompt_daily ?? "",
-    });
-    modelsList.value = await invoke<string[]>("fetch_models");
+    const p = cfg.value.providers[pi];
+    if (!p.base_url.trim()) { modelsMsg.value = "先填该厂商的 API 地址"; modelsBusy.value = false; return; }
+    // 先保存当前全部配置，保证后端拿到最新值
+    await saveConfig();
+    modelsList.value = (await invoke<string[]>("fetch_models", { providerIndex: pi }))
+      .map(s => { const [id, kind] = s.split("|"); return { id, kind }; });
     if (!modelsList.value.length) modelsMsg.value = "接口没返回模型";
   } catch (e) { modelsMsg.value = "❌ " + String(e).slice(0, 160); }
   modelsBusy.value = false;
@@ -800,22 +823,45 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
     <form @submit.prevent="saveConfig" class="cfgform">
 
       <template v-if="setTab === 'ai'">
-      <h3 class="sect">🤖 API 模型</h3>
-      <label>API 地址（base_url）</label>
-      <input v-model="cfg.base_url" placeholder="https://api.example.com/v1" />
-      <label>API Key</label>
-      <input v-model="cfg.api_key" type="password" placeholder="sk-..." />
-      <label>模型名</label>
-      <div class="rowsep">
-        <input v-model="cfg.model" placeholder="gpt-4o-mini / deepseek-chat / agnes-chat …" class="grow" />
-        <button type="button" class="mini" :disabled="modelsBusy" @click="fetchModels">{{ modelsBusy ? "获取中…" : "⟳ 获取模型" }}</button>
+      <h3 class="sect">🤖 模型厂商（可配多家并存）</h3>
+      <p class="tip">点厂商名展开：填 Key → 获取模型 → 保存。各家独立存 Key，互不冲突。</p>
+      <div v-for="(p, pi) in cfg.providers" :key="pi" class="provcard">
+        <div class="provhead" @click="openProv = openProv === pi ? -1 : pi">
+          <span class="provname">{{ p.name || ('厂商 ' + (pi+1)) }}</span>
+          <span class="provbadge" :class="p.api_key ? 'okb' : ''">{{ p.api_key ? '已配 Key' : '未配 Key' }}</span>
+          <span class="mut" style="font-size:12px;margin-left:auto;display:flex;gap:8px;align-items:center">
+            <label class="chkline" style="margin:0" @click.stop><input type="radio" name="textprov" :checked="cfg.active_provider === pi" @change="cfg.active_provider = pi" /> 文本用</label>
+            <label class="chkline" style="margin:0" @click.stop><input type="radio" name="imgprov" :checked="cfg.image_provider === pi" @change="cfg.image_provider = pi" /> 图片用</label>
+            <a @click.stop="delProvider(pi)" style="cursor:pointer">🗑</a>
+          </span>
+          <span>{{ openProv === pi ? '∨' : '›' }}</span>
+        </div>
+        <div v-if="openProv === pi" class="provbody" style="padding:8px 4px;display:block">
+          <label>厂商名</label>
+          <input v-model="p.name" placeholder="如：Agnes / 硅基流动 / 自建" />
+          <label>API 地址（Base URL）</label>
+          <input v-model="p.base_url" placeholder="https://api.example.com/v1" />
+          <label>API Key</label>
+          <input v-model="p.api_key" type="password" placeholder="sk-..." />
+          <label>文本模型（model id）</label>
+          <div class="rowsep">
+            <input v-model="p.model" placeholder="gpt-4o-mini / deepseek-chat …" class="grow" />
+            <button type="button" class="mini" :disabled="modelsBusy" @click="fetchModels(pi)">{{ modelsBusy ? "获取中…" : "⟳ 获取模型" }}</button>
+          </div>
+          <div v-if="modelsList.length" class="modellist">
+            <div v-for="mm in modelsList" :key="mm.id" class="modelitem" @click="pickModel(pi, mm)">
+              <span>{{ mm.kind === 'image' ? '🖼️' : '📝' }} {{ mm.id }}</span>
+              <span class="mut" style="font-size:11px">{{ mm.kind === 'image' ? '图片' : '文本' }}</span>
+            </div>
+          </div>
+          <p v-if="modelsMsg" class="mut" style="font-size:12px;margin:4px 0">{{ modelsMsg }}</p>
+        </div>
       </div>
-      <div v-if="modelsList.length" class="modellist">
-        <div v-for="m in modelsList" :key="m" class="modelitem" @click="cfg.model = m; modelsList = []">{{ m }}</div>
+      <div class="rowsep" style="margin:8px 0">
+        <button type="button" class="mini" @click="addProvider">＋ 添加模型</button>
       </div>
-      <p v-if="modelsMsg" class="mut" style="font-size:12px;margin:4px 0">{{ modelsMsg }}</p>
-      <p class="tip">填 OpenAI 兼容接口即可（chat/completions）。AI 整理知识卡会走这里。</p>
-      <h3 class="sect">🎛️ 成卡/创作预设（AI 提示词模板）</h3>
+      <p v-if="curTextModel" class="tip">📝 文本模型用：<b>{{ curTextModel }}</b> ｜ 🖼️ 图片模型用：<b>{{ curImageModel || '未设置' }}</b></p>
+<h3 class="sect">🎛️ 成卡/创作预设（AI 提示词模板）</h3>
       <p class="tip">每类内容用专属模板；留空 = 用内置默认。占位符会被自动替换。</p>
       <label>文章成卡模板（占位符：{url} {content}）</label>
       <textarea v-model="cfg.prompt_article" rows="4" placeholder="留空用默认：一句话结论/展开/下一步行动"></textarea>
@@ -1079,4 +1125,15 @@ form .ok:hover, .cfgform .ok:hover { background: #06AD56; }
 .modellist { max-height: 180px; overflow-y: auto; border: 1px solid #d9dce3; border-radius: 8px; background: #fff; margin-top: 4px; box-shadow: 0 4px 14px rgba(0,0,0,.08); }
 .modelitem { padding: 6px 10px; font-size: 12px; cursor: pointer; border-bottom: 1px solid #f0f1f4; }
 .modelitem:hover { background: #e8f9ef; color: #07C160; }
+/* 厂商卡片 */
+.provcard { border: 1px solid #e3e6ec; border-radius: 10px; background: #fff; margin-bottom: 8px; overflow: hidden; }
+.provhead { display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: pointer; font-weight: 600; }
+.provhead:hover { background: #f6f7f9; }
+.provname { font-size: 14px; }
+.provbadge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #fdeaea; color: #c0392b; }
+.provbadge.okb { background: #e8f9ef; color: #07C160; }
+.provcard > div[v-if], .provcard form, .provcard .provbody { display: block; }
+.provcard { min-width: 0; }
+.provcard input, .provcard textarea { width: 100%; box-sizing: border-box; display: block; }
+.provcard label { display: block; width: 100%; }
 </style>
