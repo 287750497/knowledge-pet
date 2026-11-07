@@ -20,6 +20,8 @@ pub struct Item {
     pub status: String,    // seed(新收) | fetched(已爬正文) | read(已读) | carded(已成卡)
     pub created_at: String,
     pub error: String,
+    #[serde(default)]
+    pub keywords: String,  // 逗号分隔（frontmatter keywords，AI 提炼）
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -96,6 +98,18 @@ fn load_bookmarks(kb: &PathBuf) -> Vec<Bookmark> {
 
 fn save_bookmarks(kb: &PathBuf, b: &[Bookmark]) {
     let _ = fs::write(kb.join(".pet-bookmarks.json"), serde_json::to_string_pretty(b).unwrap());
+}
+
+// 抓取队列断点续传：queue 落盘 .pet-queue.json，重启自动恢复
+fn save_queue(state: &PetState) {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let q = state.queue.lock().unwrap().clone();
+    let _ = fs::write(kb.join(".pet-queue.json"), serde_json::to_string(&q).unwrap_or_default());
+}
+fn load_queue(kb: &PathBuf) -> Vec<String> {
+    fs::read_to_string(kb.join(".pet-queue.json")).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 pub struct PetState {
@@ -247,12 +261,14 @@ fn scan_items(kb: &PathBuf) -> Vec<Item> {
                 .find(|l| l.starts_with("# ") && !l.starts_with("#!"))
                 .map(|l| l[2..].trim().to_string())
                 .unwrap_or_else(|| p.file_name().unwrap().to_string_lossy().trim_end_matches(".md").to_string());
+            let keywords = fm_field(&text, "keywords").unwrap_or_default().trim_matches(|c| c == '[' || c == ']').to_string();
             out.push(Item {
                 id: name.clone(),
                 file: format!("10-inbox/{}", rel),
                 title, kind, url, status,
                 created_at: name.chars().take(12).collect(),
                 error: String::new(),
+                keywords,
             });
         }
     }
@@ -288,7 +304,7 @@ fn capture(state: State<PetState>, text: String) -> Result<Item, String> {
     let full = kb.join("10-inbox").join(&fname);
     fs::create_dir_all(full.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&full, body).map_err(|e| e.to_string())?;
-    if is_url { state.queue.lock().unwrap().push(id.clone()); }
+    if is_url { state.queue.lock().unwrap().push(id.clone()); save_queue(&state); }
     Ok(Item {
         id: fname.trim_end_matches(".md").to_string(), // 与 scan_items 一致（文件名 id）
         file: format!("10-inbox/{}", fname),
@@ -298,6 +314,7 @@ fn capture(state: State<PetState>, text: String) -> Result<Item, String> {
         status: "seed".into(),
         created_at: chrono_today(),
         error: String::new(),
+        keywords: String::new(),
     })
 }
 
@@ -305,8 +322,11 @@ fn capture(state: State<PetState>, text: String) -> Result<Item, String> {
 #[tauri::command]
 async fn process_queue(state: State<'_, PetState>) -> Result<String, String> {
     let id = state.queue.lock().unwrap().pop().ok_or("队列空")?;
+    // 断点续传：pop 后立即落盘剩余队列
+    save_queue(&state);
     eprintln!("[pet] process_queue pop id={}", id);
     let kb = state.kb_dir.lock().unwrap().clone();
+    let cfg = state.config.lock().unwrap().clone();
     let items = scan_items(&kb);
     eprintln!("[pet] items: {:?}", items.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
     let it = items.iter().find(|i| i.id == id || i.id.starts_with(&id)).ok_or(format!("条目不存在：{}", id))?;
@@ -387,10 +407,27 @@ async fn process_queue(state: State<'_, PetState>) -> Result<String, String> {
         )
     };
     fs::write(dir.join("index.md"), &new_text).map_err(|e| { eprintln!("[pet] write err: {}", e); e.to_string() })?;
+    // AI 提炼关键词写进 frontmatter（失败不影响主流程）
+    let mut kw_msg = String::new();
+    let (_, key, mdl) = active_cfg(&cfg);
+    if !key.is_empty() && !mdl.is_empty() {
+        let kw_prompt = format!("读下面的文章，提炼 3-5 个主题关键词。只输出关键词，逗号分隔，不要任何解释。\n\n标题：{}\n{}",
+            title, content.chars().take(3000).collect::<String>());
+        if let Ok(kw) = ai_chat(&cfg, &kw_prompt).await {
+            let kws: Vec<String> = kw.split(|c: char| c == ',' || c == '，' || c == '\n' || c == '、')
+                .map(|x| x.trim().trim_start_matches('#').trim().to_string())
+                .filter(|x| !x.is_empty() && x.chars().count() <= 20).take(5).collect();
+            if !kws.is_empty() {
+                let _ = fs::write(dir.join("index.md"), new_text.replacen(
+                    "---\n", &format!("---\nkeywords: [{}]\n", kws.join(", ")), 1));
+                kw_msg = format!("，关键词：{}", kws.join("/"));
+            }
+        }
+    }
     // 删掉旧的 seed 占位文件（scan_items 会把文件夹下的 index.md 当新条目）
     let _ = fs::remove_file(&path);
     eprintln!("[pet] write ok {} bytes, {} imgs", new_text.len(), saved_imgs);
-    Ok(format!("已抓取：{}（附 {} 张图）", title, saved_imgs))
+    Ok(format!("已抓取：{}（附 {} 张图）{}", title, saved_imgs, kw_msg))
 }
 
 // 极简正文提取
@@ -669,7 +706,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(PetState { kb_dir: Mutex::new(kb), config: Mutex::new(cfg), queue: Mutex::new(Vec::new()) })
+        .manage(PetState { kb_dir: Mutex::new(kb.clone()), config: Mutex::new(cfg), queue: Mutex::new(load_queue(&kb)) })
         .invoke_handler(tauri::generate_handler![
             list_items, capture, process_queue, capture_text_urls, ai_make_card, mark_read, delete_item, fetch_models,
             get_config, set_config, move_kb_dir, list_bookmarks, add_bookmark, remove_bookmark,

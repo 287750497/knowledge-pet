@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import PetSprite from "./components/PetSprite.vue";
 
-interface Item { id: string; file: string; title: string; kind: string; url: string; status: string; created_at: string; error: string }
+interface Item { id: string; file: string; title: string; kind: string; url: string; status: string; created_at: string; error: string; keywords?: string }
 interface AiConfig { base_url: string; api_key: string; model: string; hotkey: string; kb_dir_override: string;
   prompt_article?: string; prompt_wechat?: string; prompt_quote?: string; prompt_topics?: string; prompt_daily?: string;
   providers: ProviderCfg[]; active_provider: number; image_provider: number; image_model: string;
@@ -85,9 +85,11 @@ async function openPanelForSettings() {
   } catch (e) { showBubble("⚠️ 打开设置失败"); }
 }
 
-const shown = computed(() =>
-  filter.value === "all" ? items.value : items.value.filter(i => i.status === filter.value)
-);
+const shown = computed(() => {
+  let arr = filter.value === "all" ? items.value : items.value.filter(i => i.status === filter.value);
+  if (kwFilter.value) arr = arr.filter(i => (i.keywords || "").includes(kwFilter.value));
+  return arr;
+});
 
 async function refresh() {
   items.value = await invoke<Item[]>("list_items");
@@ -306,6 +308,8 @@ async function testConfig() {
   refresh();
 }
 
+// ---- 关键词筛选 ----
+const kwFilter = ref("");
 // ---- 贴文本抠链接 ----
 const pasteBox = ref(false);
 const pasteText = ref("");
@@ -1156,4 +1160,9 @@ form .ok:hover, .cfgform .ok:hover { background: #06AD56; }
 .provcard { min-width: 0; }
 .provcard input, .provcard textarea { width: 100%; box-sizing: border-box; display: block; }
 .provcard label { display: block; width: 100%; }
+/* 关键词标签 */
+.kwrow { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; }
+.kwtag { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: #eef2f7; color: #64748B; cursor: pointer; }
+.kwtag:hover { color: #07C160; }
+.kwtag.on { background: #07C160; color: #fff; }
 </style>
