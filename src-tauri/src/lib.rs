@@ -20,6 +20,22 @@ pub struct Item {
     pub status: String,    // seed(新收) | fetched(已爬正文) | read(已读) | carded(已成卡)
     pub created_at: String,
     pub error: String,
+    #[serde(default)]
+    pub keywords: String,  // 逗号分隔（frontmatter keywords，AI 提炼）
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct ProviderCfg {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub image_model: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -40,13 +56,33 @@ pub struct AiConfig {
     pub notion_token: String,        // Notion internal connection token
     #[serde(default)]
     pub notion_db_id: String,        // Notion 数据库 ID（收集箱）
+    // ---- 成卡/创作预设（v0.9.3：每类内容专属模板，空=内置默认）----
+    #[serde(default)]
+    pub prompt_article: String,   // 文章成卡模板 {url} {content}
+    #[serde(default)]
+    pub prompt_wechat: String,    // 微信文章成卡模板 {url} {content}
+    #[serde(default)]
+    pub prompt_quote: String,     // 引用创作模板 {goal} {snapshot}
+    #[serde(default)]
+    pub prompt_topics: String,    // 跨卡选题模板 {digest}
+    #[serde(default)]
+    pub prompt_daily: String,     // 每日冒泡文案模板 {date} {title} {conclusion} {todos}
+    // ---- 多厂商模型配置（v0.9.5：厂商卡片+文本/图片模型分组）----
+    #[serde(default)]
+    pub providers: Vec<ProviderCfg>,
+    #[serde(default)]
+    pub active_provider: usize,
+    #[serde(default)]
+    pub image_provider: i64,
+    #[serde(default)]
+    pub image_model: String,
 }
 
 fn default_hotkey() -> String { "Ctrl+Alt+C".into() }
 
 impl Default for AiConfig {
     fn default() -> Self {
-        AiConfig { base_url: String::new(), api_key: String::new(), model: String::new(), hotkey: default_hotkey(), kb_dir_override: String::new(), feishu_webhook: String::new(), feishu_push_daily: false, notion_token: String::new(), notion_db_id: String::new() }
+        AiConfig { base_url: String::new(), api_key: String::new(), model: String::new(), hotkey: default_hotkey(), kb_dir_override: String::new(), feishu_webhook: String::new(), feishu_push_daily: false, notion_token: String::new(), notion_db_id: String::new(), prompt_article: String::new(), prompt_wechat: String::new(), prompt_quote: String::new(), prompt_topics: String::new(), prompt_daily: String::new(), providers: Vec::new(), active_provider: 0, image_provider: -1, image_model: String::new() }
     }
 }
 
@@ -64,6 +100,18 @@ fn save_bookmarks(kb: &PathBuf, b: &[Bookmark]) {
     let _ = fs::write(kb.join(".pet-bookmarks.json"), serde_json::to_string_pretty(b).unwrap());
 }
 
+// 抓取队列断点续传：queue 落盘 .pet-queue.json，重启自动恢复
+fn save_queue(state: &PetState) {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let q = state.queue.lock().unwrap().clone();
+    let _ = fs::write(kb.join(".pet-queue.json"), serde_json::to_string(&q).unwrap_or_default());
+}
+fn load_queue(kb: &PathBuf) -> Vec<String> {
+    fs::read_to_string(kb.join(".pet-queue.json")).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 pub struct PetState {
     pub kb_dir: Mutex<PathBuf>,   // 可迁移，加锁
     pub config: Mutex<AiConfig>,
@@ -76,9 +124,31 @@ fn now_id() -> String {
 }
 
 fn load_config(kb: &PathBuf) -> AiConfig {
-    fs::read_to_string(kb.join(".pet-config.json")).ok()
+    let mut c: AiConfig = fs::read_to_string(kb.join(".pet-config.json")).ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 旧单组配置 → 迁移成第一个厂商（无缝升级）
+    if c.providers.is_empty() && (!c.base_url.is_empty() || !c.api_key.is_empty()) {
+        c.providers.push(ProviderCfg {
+            name: "默认厂商".into(),
+            base_url: c.base_url.clone(),
+            api_key: c.api_key.clone(),
+            model: c.model.clone(),
+            image_model: String::new(),
+        });
+    }
+    if c.active_provider >= c.providers.len() { c.active_provider = 0; }
+    if c.image_provider >= c.providers.len() as i64 { c.image_provider = -1; }
+    c
+}
+
+/// 当前生效的文本模型厂商配置（providers 空=旧字段）
+pub fn active_cfg(cfg: &AiConfig) -> (&String, &String, &String) {
+    if let Some(p) = cfg.providers.get(cfg.active_provider) {
+        (&p.base_url, &p.api_key, &p.model)
+    } else {
+        (&cfg.base_url, &cfg.api_key, &cfg.model)
+    }
 }
 
 fn save_config(kb: &PathBuf, c: &AiConfig) {
@@ -171,11 +241,18 @@ fn scan_items(kb: &PathBuf) -> Vec<Item> {
     let inbox = kb.join("10-inbox");
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(&inbox) {
-        let mut files: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |x| x == "md")).collect();
+        let entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        let mut files: Vec<_> = entries.iter().map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "md"))
+            .chain(entries.iter().filter(|e| e.path().is_dir())
+                .filter_map(|d| fs::read_dir(d.path()).ok()
+                    .and_then(|rd2| rd2.filter_map(|e| e.ok())
+                        .find(|e| e.file_name() == "index.md").map(|e| e.path()))))
+            .collect();
         files.sort();
         for p in files {
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            let rel = p.strip_prefix(&inbox).unwrap_or(&p).to_string_lossy().to_string();
+            let name = rel.trim_end_matches(".md").to_string();
             let text = fs::read_to_string(&p).unwrap_or_default();
             let status = fm_field(&text, "status").unwrap_or_else(|| "seed".into());
             let kind = fm_field(&text, "kind").unwrap_or_else(|| "text".into());
@@ -183,13 +260,15 @@ fn scan_items(kb: &PathBuf) -> Vec<Item> {
             let title = text.lines()
                 .find(|l| l.starts_with("# ") && !l.starts_with("#!"))
                 .map(|l| l[2..].trim().to_string())
-                .unwrap_or_else(|| name.trim_end_matches(".md").to_string());
+                .unwrap_or_else(|| p.file_name().unwrap().to_string_lossy().trim_end_matches(".md").to_string());
+            let keywords = fm_field(&text, "keywords").unwrap_or_default().trim_matches(|c| c == '[' || c == ']').to_string();
             out.push(Item {
-                id: name.trim_end_matches(".md").to_string(),
-                file: format!("10-inbox/{}", name),
+                id: name.clone(),
+                file: format!("10-inbox/{}", rel),
                 title, kind, url, status,
                 created_at: name.chars().take(12).collect(),
                 error: String::new(),
+                keywords,
             });
         }
     }
@@ -225,7 +304,7 @@ fn capture(state: State<PetState>, text: String) -> Result<Item, String> {
     let full = kb.join("10-inbox").join(&fname);
     fs::create_dir_all(full.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&full, body).map_err(|e| e.to_string())?;
-    if is_url { state.queue.lock().unwrap().push(id.clone()); }
+    if is_url { state.queue.lock().unwrap().push(id.clone()); save_queue(&state); }
     Ok(Item {
         id: fname.trim_end_matches(".md").to_string(), // 与 scan_items 一致（文件名 id）
         file: format!("10-inbox/{}", fname),
@@ -235,6 +314,7 @@ fn capture(state: State<PetState>, text: String) -> Result<Item, String> {
         status: "seed".into(),
         created_at: chrono_today(),
         error: String::new(),
+        keywords: String::new(),
     })
 }
 
@@ -242,8 +322,11 @@ fn capture(state: State<PetState>, text: String) -> Result<Item, String> {
 #[tauri::command]
 async fn process_queue(state: State<'_, PetState>) -> Result<String, String> {
     let id = state.queue.lock().unwrap().pop().ok_or("队列空")?;
+    // 断点续传：pop 后立即落盘剩余队列
+    save_queue(&state);
     eprintln!("[pet] process_queue pop id={}", id);
     let kb = state.kb_dir.lock().unwrap().clone();
+    let cfg = state.config.lock().unwrap().clone();
     let items = scan_items(&kb);
     eprintln!("[pet] items: {:?}", items.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
     let it = items.iter().find(|i| i.id == id || i.id.starts_with(&id)).ok_or(format!("条目不存在：{}", id))?;
@@ -260,13 +343,91 @@ async fn process_queue(state: State<'_, PetState>) -> Result<String, String> {
     eprintln!("[pet] html len={}", html.len());
     let (title, content) = extract_article(&html);
     eprintln!("[pet] extracted title={:?} content_len={} writing...", title, content.len());
-    let new_text = format!(
-        "---\nkind: url\nurl: {}\nstatus: fetched\ncreated: {}\n---\n\n# {}\n\n> 来源：{}\n\n{}",
-        url, chrono_today(), title, url, content
-    );
-    fs::write(&path, &new_text).map_err(|e| { eprintln!("[pet] write err: {}", e); e.to_string() })?;
-    eprintln!("[pet] write ok {} bytes", new_text.len());
-    Ok(format!("已抓取：{}", title))
+    // 每篇文章单独文件夹：10-inbox/[作者/]日期-标题/index.md + images/（借鉴数海丹心下载工具+AISet 素材库按作者归档）
+    // 微信文章从 html 里抠公众号名（var nickname = "xx" 或 window.nickname）
+    let author = html.find("nickname").and_then(|p| {
+        let seg = &html[p..(p + 120).min(html.len())];
+        // nickname = "xx" 或 nickname: "xx" —— 跳过 = / : 后找引号
+        let after = seg.find(|c| c == '=' || c == ':')?;
+        let rest = &seg[after..];
+        let q1 = rest.find('"')?; let rest2 = &rest[q1 + 1..]; let q2 = rest2.find('"')?;
+        let n = rest2[..q2].trim();
+        (!n.is_empty() && n.len() < 60).then(|| n.to_string())
+    }).unwrap_or_default();
+    let folder_rel = if author.is_empty() {
+        sanitize(&format!("{}-{}", chrono_today(), title.chars().take(40).collect::<String>()))
+    } else {
+        format!("{}/{}", sanitize(&author), sanitize(&format!("{}-{}", chrono_today(), title.chars().take(40).collect::<String>())))
+    };
+    let dir = kb.join("10-inbox").join(&folder_rel);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // 下载文中图片（还原懒加载 data-src），失败不阻塞
+    let img_dir = dir.join("images");
+    let mut saved_imgs = 0;
+    let lower = html.to_lowercase();
+    let mut img_urls: Vec<String> = Vec::new();
+    for attr in ["data-src", "src"] {
+        let mut from = 0;
+        while let Some(p) = lower[from..].find(&format!("{}=\"{}", attr, "http")) {
+            let start = from + p + attr.len() + 2;
+            let end = html[start..].find('"').map(|x| start + x).unwrap_or(start);
+            let u = html[start..end.min(html.len())].to_string();
+            if (u.starts_with("http://") || u.starts_with("https://")) && !img_urls.contains(&u) {
+                let tail = u.rsplit('.').next().unwrap_or("png").to_lowercase();
+                if ["png","jpg","jpeg","gif","webp"].contains(&tail.as_str()) { img_urls.push(u); }
+            }
+            from = end.max(from + 1);
+            if img_urls.len() >= 30 { break; }
+        }
+    }
+    let cli = reqwest::Client::new();
+    let mut idx = 1;
+    for u in &img_urls {
+        if let Ok(bytes) = cli.get(u).send().await {
+            if let Ok(b) = bytes.bytes().await {
+                if b.len() > 1024 {
+                    let ext = u.rsplit('.').next().unwrap_or("png").split('?').next().unwrap_or("png");
+                    let _ = fs::create_dir_all(&img_dir);
+                    if fs::write(img_dir.join(format!("img-{:02}.{}", idx, ext)), &b).is_ok() { saved_imgs += 1; idx += 1; }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let new_text = if author.is_empty() {
+        format!(
+            "---\nkind: url\nurl: {}\nstatus: fetched\ncreated: {}\n---\n\n# {}\n\n> 来源：{}\n> 附件：images/ 共 {} 张\n\n{}",
+            url, chrono_today(), title, url, saved_imgs, content
+        )
+    } else {
+        format!(
+            "---\nkind: url\nurl: {}\nauthor: {}\nstatus: fetched\ncreated: {}\n---\n\n# {}\n\n> 来源：{}（{}）\n> 附件：images/ 共 {} 张\n\n{}",
+            url, author, chrono_today(), title, url, author, saved_imgs, content
+        )
+    };
+    fs::write(dir.join("index.md"), &new_text).map_err(|e| { eprintln!("[pet] write err: {}", e); e.to_string() })?;
+    // AI 提炼关键词写进 frontmatter（失败不影响主流程）
+    let mut kw_msg = String::new();
+    let (_, key, mdl) = active_cfg(&cfg);
+    if !key.is_empty() && !mdl.is_empty() {
+        let kw_prompt = format!("读下面的文章，提炼 3-5 个主题关键词。只输出关键词，逗号分隔，不要任何解释。\n\n标题：{}\n{}",
+            title, content.chars().take(3000).collect::<String>());
+        if let Ok(kw) = ai_chat(&cfg, &kw_prompt).await {
+            let kws: Vec<String> = kw.split(|c: char| c == ',' || c == '，' || c == '\n' || c == '、')
+                .map(|x| x.trim().trim_start_matches('#').trim().to_string())
+                .filter(|x| !x.is_empty() && x.chars().count() <= 20).take(5).collect();
+            if !kws.is_empty() {
+                let _ = fs::write(dir.join("index.md"), new_text.replacen(
+                    "---\n", &format!("---\nkeywords: [{}]\n", kws.join(", ")), 1));
+                kw_msg = format!("，关键词：{}", kws.join("/"));
+            }
+        }
+    }
+    // 删掉旧的 seed 占位文件（scan_items 会把文件夹下的 index.md 当新条目）
+    let _ = fs::remove_file(&path);
+    eprintln!("[pet] write ok {} bytes, {} imgs", new_text.len(), saved_imgs);
+    Ok(format!("已抓取：{}（附 {} 张图）{}", title, saved_imgs, kw_msg))
 }
 
 // 极简正文提取
@@ -310,10 +471,14 @@ async fn ai_make_card(state: State<'_, PetState>, id: String) -> Result<String, 
     let items = scan_items(&kb);
     let it = items.iter().find(|i| i.id == id).ok_or("条目不存在")?;
     let text = fs::read_to_string(kb.join(&it.file)).map_err(|e| e.to_string())?;
-    let prompt = format!(
-        "你是知识库管理员。把下面的素材整理成一张知识卡。\n输出 frontmatter + 正文，格式严格如下（YAML）:\n---\ntitle: 卡片标题（10字内）\ntags: [标签1, 标签2]\nstatus: seed\nsource: \"{}\"\n---\n\n# 一句话结论\n\n（最核心的判断一句话）\n\n## 展开\n\n（要点、例子，markdown 列表，300字内）\n\n## 下一步行动\n\n- [ ] 一个可执行的下一步\n\n素材：\n{}",
-        it.url, text
-    );
+    let prompt = if cfg.prompt_article.trim().is_empty() {
+        format!(
+            "你是知识库管理员。把下面的素材整理成一张知识卡。\n输出 frontmatter + 正文，格式严格如下（YAML）:\n---\ntitle: 卡片标题（10字内）\ntags: [标签1, 标签2]\nstatus: seed\nsource: \"{}\"\n---\n\n# 一句话结论\n\n（最核心的判断一句话）\n\n## 展开\n\n（要点、例子，markdown 列表，300字内）\n\n## 下一步行动\n\n- [ ] 一个可执行的下一步\n\n素材：\n{}",
+            it.url, text
+        )
+    } else {
+        cfg.prompt_article.replace("{url}", &it.url).replace("{content}", &text)
+    };
     let cli = reqwest::Client::new();
     let resp = cli.post(format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')))
         .bearer_auth(&cfg.api_key)
@@ -400,10 +565,29 @@ fn remove_bookmark(state: State<PetState>, url: String) -> Result<(), String> {
 fn get_config(state: State<PetState>) -> AiConfig { state.config.lock().unwrap().clone() }
 
 #[tauri::command]
-fn set_config(state: State<PetState>, base_url: String, api_key: String, model: String, hotkey: Option<String>) {
+fn set_config(state: State<PetState>, base_url: String, api_key: String, model: String, hotkey: Option<String>,
+    prompt_article: Option<String>, prompt_wechat: Option<String>, prompt_quote: Option<String>,
+    prompt_topics: Option<String>, prompt_daily: Option<String>,
+    providers: Option<Vec<ProviderCfg>>, active_provider: Option<usize>,
+    image_provider: Option<i64>, image_model: Option<String>) {
     let mut c = state.config.lock().unwrap();
     c.base_url = base_url; c.api_key = api_key; c.model = model;
     if let Some(h) = hotkey { if !h.trim().is_empty() { c.hotkey = h.trim().to_string(); } }
+    // 模板：传 None=不改；传 Some("")=清空恢复默认
+    if let Some(t) = prompt_article { c.prompt_article = t; }
+    if let Some(t) = prompt_wechat { c.prompt_wechat = t; }
+    if let Some(t) = prompt_quote { c.prompt_quote = t; }
+    if let Some(t) = prompt_topics { c.prompt_topics = t; }
+    if let Some(t) = prompt_daily { c.prompt_daily = t; }
+    // 多厂商：传 None=不改
+    if let Some(ps) = providers { c.providers = ps; }
+    if let Some(i) = active_provider { if i < c.providers.len().max(1) { c.active_provider = i; } }
+    if let Some(i) = image_provider { c.image_provider = i; }
+    if let Some(m) = image_model { c.image_model = m; }
+    // providers 有值时把文本厂商的值回写旧字段（兼容所有旧调用点）
+    if let Some(p) = c.providers.get(c.active_provider).cloned() {
+        c.base_url = p.base_url; c.api_key = p.api_key; c.model = p.model;
+    }
     let kb = state.kb_dir.lock().unwrap().clone();
     save_config(&kb, &c);
 }
@@ -522,9 +706,9 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(PetState { kb_dir: Mutex::new(kb), config: Mutex::new(cfg), queue: Mutex::new(Vec::new()) })
+        .manage(PetState { kb_dir: Mutex::new(kb.clone()), config: Mutex::new(cfg), queue: Mutex::new(load_queue(&kb)) })
         .invoke_handler(tauri::generate_handler![
-            list_items, capture, process_queue, ai_make_card, mark_read, delete_item,
+            list_items, capture, process_queue, capture_text_urls, ai_make_card, mark_read, delete_item, fetch_models,
             get_config, set_config, move_kb_dir, list_bookmarks, add_bookmark, remove_bookmark,
             stats, bubble, open_kb, read_clipboard_text,
             list_cards, quote_create, list_drafts, gen_topics, daily_review,
@@ -686,6 +870,36 @@ fn scan_cards(kb: &PathBuf) -> Vec<CardItem> {
     out
 }
 
+/// 拉取厂商模型列表；provider_index=None=用文本厂商（或旧字段）。返回 "id|kind"（kind: text|image）。
+#[tauri::command]
+async fn fetch_models(state: State<'_, PetState>, provider_index: Option<i64>) -> Result<Vec<String>, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    let idx = provider_index.map(|i| if i < 0 { cfg.active_provider } else { i as usize });
+    let (base, key) = match idx.and_then(|i| cfg.providers.get(i)) {
+        Some(p) => (p.base_url.clone(), p.api_key.clone()),
+        None => { let (b, k, _) = active_cfg(&cfg); (b.clone(), k.clone()) }
+    };
+    if base.trim().is_empty() { return Err("请先填 API 地址".into()); }
+    let cli = reqwest::Client::new();
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    let mut req = cli.get(&url);
+    if !key.trim().is_empty() { req = req.bearer_auth(key.trim()); }
+    let resp = req.send().await.map_err(|e| format!("请求失败：{}", e))?;
+    let j: serde_json::Value = resp.json().await.map_err(|e| format!("返回异常：{}", e))?;
+    let mut out: Vec<String> = j["data"].as_array()
+        .map(|a| a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    out.sort();
+    if out.is_empty() { return Err(format!("接口没返回模型列表：{}", serde_json::to_string(&j).unwrap_or_default().chars().take(150).collect::<String>())); }
+    // 启发式标记：图片模型 🖼️image / 文本 📝text
+    let img_kw = ["image", "vision", "dall", "flux", "sd", "stable", "diffusion", "imagen", "seedream", "cogview", "wanx"];
+    Ok(out.into_iter().map(|id| {
+        let lower = id.to_lowercase();
+        let kind = if img_kw.iter().any(|k| lower.contains(k)) { "image" } else { "text" };
+        format!("{}|{}", id, kind)
+    }).collect())
+}
+
 #[tauri::command]
 fn list_cards(state: State<PetState>) -> Vec<CardItem> {
     scan_cards(&state.kb_dir.lock().unwrap().clone())
@@ -721,10 +935,14 @@ async fn quote_create(state: State<'_, PetState>, files: Vec<String>, goal: Stri
         used.push(f.clone());
         snapshot.push_str(&format!("\n\n----- 知识卡：{} -----\n{}", f, text));
     }
-    let prompt = format!(
-        "你是内容创作助手。基于下面的知识卡素材完成写作任务。\n铁律：观点和事实尽量来自知识卡原文（可引用原句）；知识卡里没有的数据/事实一律不写，不许编造。\n直接输出正文（Markdown），不要额外解释。\n\n【写作任务】\n{}\n\n【知识卡素材】{}",
-        goal, snapshot
-    );
+    let prompt = if cfg.prompt_quote.trim().is_empty() {
+        format!(
+            "你是内容创作助手。基于下面的知识卡素材完成写作任务。\n铁律：观点和事实尽量来自知识卡原文（可引用原句）；知识卡里没有的数据/事实一律不写，不许编造。\n直接输出正文（Markdown），不要额外解释。\n\n【写作任务】\n{}\n\n【知识卡素材】{}",
+            goal, snapshot
+        )
+    } else {
+        cfg.prompt_quote.replace("{goal}", &goal).replace("{snapshot}", &snapshot)
+    };
     let content = ai_chat(&cfg, &prompt).await?;
     // 草稿文件：frontmatter 含 used 快照
     let fname = format!("{}-{}.md", chrono_today(), sanitize(&goal.chars().take(24).collect::<String>()));
@@ -770,9 +988,13 @@ async fn gen_topics(state: State<'_, PetState>) -> Result<Vec<String>, String> {
     let cards = scan_cards(&kb);
     if cards.len() < 2 { return Err("知识卡不足 2 张，先去收集素材".into()); }
     let digest = cards.iter().map(|c| format!("- 《{}》({})：{}", c.title, c.tags, c.conclusion)).collect::<Vec<_>>().join("\n");
-    let prompt = format!(
-        "下面是我的知识卡片清单（标题+标签+一句话结论）。请把它们两两组合、跨领域碰撞，提炼 5 个值得写的选题。\n每个选题一行，格式：「选题名 — 用哪几张卡（引用标题）— 为什么值得写（一句话）」。只输出 5 行。\n\n{}", digest
-    );
+    let prompt = if cfg.prompt_topics.trim().is_empty() {
+        format!(
+            "下面是我的知识卡片清单（标题+标签+一句话结论）。请把它们两两组合、跨领域碰撞，提炼 5 个值得写的选题。\n每个选题一行，格式：「选题名 — 用哪几张卡（引用标题）— 为什么值得写（一句话）」。只输出 5 行。\n\n{}", digest
+        )
+    } else {
+        cfg.prompt_topics.replace("{digest}", &digest)
+    };
     let content = ai_chat(&cfg, &prompt).await?;
     Ok(content.lines().filter(|l| !l.trim().is_empty()).map(|s| s.to_string()).collect())
 }
@@ -809,6 +1031,65 @@ fn daily_review(state: State<PetState>) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "card": { "title": r.title, "conclusion": r.conclusion }, "todos": r.todos }))
 }
 
+
+#[cfg(test)]
+mod v095_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_scan_items_finds_subfolder_index() {
+        let dir = std::env::temp_dir().join(format!("pet-v095-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("10-inbox")).unwrap();
+        fs::write(dir.join("10-inbox/old.md"), "---\nstatus: seed\nkind: text\n---\n\n# 旧条目\n内容").unwrap();
+        fs::create_dir_all(dir.join("10-inbox/2026-11-07-测试文章/images")).unwrap();
+        fs::write(dir.join("10-inbox/2026-11-07-测试文章/index.md"),
+            "---\nkind: url\nurl: https://x\nstatus: fetched\ncreated: 2026-11-07\n---\n\n# 测试文章标题\n\n正文").unwrap();
+        let items = scan_items(&dir);
+        assert_eq!(items.len(), 2, "应同时找到顶层 md 与子文件夹 index.md");
+        let sub = items.iter().find(|i| i.file.contains("index.md")).expect("子文件夹条目");
+        assert_eq!(sub.title, "测试文章标题");
+        assert_eq!(sub.status, "fetched");
+        assert!(sub.file.starts_with("10-inbox/2026-11-07-测试文章/index.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_nickname_extract() {
+        let html = r#"<script>var nickname = "前端晚自习"; var biz = "x";</script>"#;
+        let p = html.find("nickname").unwrap();
+        let seg = &html[p..(p + 120).min(html.len())];
+        let after = seg.find(|c| c == '=' || c == ':').unwrap();
+        let rest = &seg[after..];
+        let q1 = rest.find('"').unwrap(); let rest2 = &rest[q1 + 1..]; let q2 = rest2.find('"').unwrap();
+        assert_eq!(rest2[..q2].trim(), "前端晚自习");
+        // nickname 出现在无赋值上下文（如 css class）时不应误抠
+        let html2 = r#"<div class="nickname">正文</div>"#;
+        let seg2 = &html2[html2.find("nickname").unwrap()..];
+        let no_assign = seg2.find(|c| c == '=' || c == ':').is_none();
+        assert!(no_assign);
+    }
+
+    #[test]
+    fn test_url_extract_from_pasted_text() {
+        // 与 capture_text_urls 相同的分隔逻辑（复制保持一致）
+        let text = "看看这两篇 https://mp.weixin.qq.com/s/abc123 和 http://example.com/a?x=1)还有这个<br>https://mp.weixin.qq.com/s/abc123 重复";
+        let mut urls = Vec::new();
+        for word in text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == '>') {
+            let w = word.trim_start_matches('(').trim_start_matches('<');
+            let url = if w.starts_with("http://") || w.starts_with("https://") {
+                w.split(|c| c == '<' || c == '>').next().unwrap_or(w).to_string()
+            } else { continue };
+            let url = url.trim_end_matches(&[')', '>', ',', '，', '。', '；', ';'][..]).to_string();
+            if url.len() < 12 || urls.contains(&url) { continue; }
+            urls.push(url);
+        }
+        assert_eq!(urls.len(), 2, "应抠出 2 个去重后的 URL");
+        assert_eq!(urls[0], "https://mp.weixin.qq.com/s/abc123");
+        assert_eq!(urls[1], "http://example.com/a?x=1");
+    }
+}
 
 #[cfg(test)]
 mod workshop_tests {
@@ -896,4 +1177,33 @@ mod workshop_tests {
         assert!(todos[0].starts_with("待办"), "todos={:?} card={}", todos, card.title);
         fs::remove_dir_all(&dir).ok();
     }
+}/// 从粘贴文本中抠出所有 URL，去重后批量入队（借鉴数海丹心下载工具）
+#[tauri::command]
+fn capture_text_urls(state: State<PetState>, text: String) -> Result<String, String> {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let mut added = 0; let mut skipped = 0;
+    let existing: Vec<String> = scan_items(&kb).iter().map(|i| i.url.clone()).collect();
+    let mut seen: Vec<String> = Vec::new();
+    for word in text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == '>') {
+        let w = word.trim_start_matches('(').trim_start_matches('<');
+        let url = if w.starts_with("http://") || w.starts_with("https://") {
+            w.split(|c| c == '<' || c == '>').next().unwrap_or(w).to_string()
+        } else { continue };
+        let url = url.trim_end_matches(&[')', '>', ',', '，', '。', '；', ';'][..]).to_string();
+        if url.len() < 12 || seen.contains(&url) { continue; }
+        seen.push(url.clone());
+        if existing.contains(&url) { skipped += 1; continue; }
+        let id = now_id();
+        let fname = format!("{}-网页剪藏.md", id);
+        let body = format!("---\nkind: url\nurl: {}\nstatus: seed\ncreated: {}\n---\n\n# 网页剪藏\n\n{}", url, chrono_today(), url);
+        let full = kb.join("10-inbox").join(&fname);
+        fs::create_dir_all(full.parent().unwrap()).map_err(|e| e.to_string())?;
+        fs::write(&full, body).map_err(|e| e.to_string())?;
+        state.queue.lock().unwrap().push(id.clone());
+        added += 1;
+    }
+    if added == 0 && skipped == 0 { return Err("文本里没找到链接".into()); }
+    Ok(format!("已加入 {} 条链接{}（重复跳过 {}）", added, if skipped > 0 { "，已收过的不再收" } else { "" }, skipped))
 }
+
+

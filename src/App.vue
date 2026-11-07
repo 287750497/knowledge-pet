@@ -266,6 +266,9 @@ async function moveKb() {
     const msg = await invoke<string>("move_kb_dir", { newDir: kbNew.value });
     prog.value = 100; moveMsg.value = "✓ " + msg;
     cfg.value = await invoke<AiConfig>("get_config");
+    if (!cfg.value.providers) cfg.value.providers = [];
+    if (cfg.value.active_provider == null) cfg.value.active_provider = 0;
+    if (cfg.value.image_provider == null) cfg.value.image_provider = -1;
     showBubble("✓ 知识库已迁移");
   } catch (e) { moveMsg.value = "⚠️ " + String(e); prog.value = 0; }
   moving.value = false;
@@ -310,6 +313,7 @@ async function testConfig() {
 
 // ---- 关键词筛选 ----
 const kwFilter = ref("");
+const navTab = ref<"inbox"|"wx"|"watch"|"daily"|"topics"|"quote"|"marks">("inbox");
 // ---- 贴文本抠链接 ----
 const pasteBox = ref(false);
 const pasteText = ref("");
@@ -559,6 +563,9 @@ onMounted(async () => {
     view.value = label === "pet" ? "pet" : "panel";
   } catch { view.value = "panel"; }
   cfg.value = await invoke<AiConfig>("get_config");
+    if (!cfg.value.providers) cfg.value.providers = [];
+    if (cfg.value.active_provider == null) cfg.value.active_provider = 0;
+    if (cfg.value.image_provider == null) cfg.value.image_provider = -1;
   refresh();
   loadBookmarks();
   pollTimer = window.setInterval(refresh, 5000);
@@ -693,14 +700,25 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
   </div>
 
   <!-- 管理面板 -->
-  <div v-else-if="view === 'panel'" class="panel">
-    <header>
-      <button class="mini" @click="backToPet">🐱 回到桌宠</button>
-      <h2>📚 知识收藏面板</h2>
-      <button class="mini" @click="view = 'settings'">⚙ 设置</button>
-    </header>
-
-    <div class="statrow" v-if="st">
+  <div v-else-if="view === 'panel'" class="panel shell">
+    <aside class="sidenav">
+      <div class="sidehead">
+        <b>📚 知识收藏</b>
+        <button class="mini" @click="backToPet">🐱 回桌宠</button>
+      </div>
+      <button class="sideitem" :class="{ on: navTab === 'inbox' }" @click="navTab = 'inbox'">📥 采集</button>
+      <button class="sidesub" :class="{ on: navTab === 'wx' }" @click="navTab = 'wx'">微信文章采集</button>
+      <button class="sidesub" :class="{ on: navTab === 'watch' }" @click="navTab = 'watch'">公众号实时监听</button>
+      <button class="sideitem" :class="{ on: navTab === 'daily' }" @click="navTab = 'daily'">🌅 每日冒泡</button>
+      <button class="sideitem" :class="{ on: navTab === 'topics' }" @click="navTab = 'topics'">💡 跨卡选题</button>
+      <button class="sideitem" :class="{ on: navTab === 'quote' }" @click="navTab = 'quote'">✍️ 引用创作</button>
+      <button class="sideitem" :class="{ on: navTab === 'marks' }" @click="navTab = 'marks'">⭐ 常用网址</button>
+      <div class="sidefoot">
+        <button class="sideitem" @click="view = 'settings'">⚙ 设置</button>
+      </div>
+    </aside>
+    <main class="sidecontent">
+<div class="statrow" v-if="st">
       <span>共 {{ st.total }}</span>
       <span>🌱 {{ st.seed }}</span>
       <span>📄 {{ st.fetched }}</span>
@@ -719,7 +737,16 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       </div>
     </div>
 
-    <div class="filters">
+    <div v-if="pasteBox" style="margin:0 16px 8px">
+      <textarea v-model="pasteText" rows="3" placeholder="把含链接的一段话/聊天记录/笔记粘进来，自动抠出所有 URL 去重入队" style="width:100%;font-size:12px"></textarea>
+      <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+        <button class="mini ok" :disabled="!pasteText.trim()" @click="capturePaste">🔍 抠出链接入队</button>
+        <span v-if="pasteMsg" class="mut" style="font-size:12px">{{ pasteMsg }}</span>
+      </div>
+    </div>
+
+    <template v-if="navTab === 'inbox'">
+<div class="filters">
       <button v-for="f in ['all','seed','fetched','read','carded']" :key="f"
         :class="{ active: filter === f }" @click="filter = f as any">
         {{ f === 'all' ? '全部' : statusText[f] }}
@@ -744,19 +771,25 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <p v-if="!shown.length" class="empty">空空如也。去别的窗口复制点东西，然后点一下桌宠 🐱</p>
     </div>
 
-    <h3 class="bmtitle">🐱 每日冒泡 <button class="mini" @click="doDailyReview">抽一张</button></h3>
+    </template>
+<template v-else-if="navTab === 'daily'">
+<h3 class="bmtitle">🐱 每日冒泡 <button class="mini" @click="doDailyReview">抽一张</button></h3>
     <div v-if="review" class="cardblock" style="border-left:3px solid #f97316">
       <b>《{{ review.card.title }}》</b> <span class="mut">{{ review.card.tags }}</span>
       <p class="mut" style="margin:4px 0">{{ review.card.conclusion }}</p>
       <p v-if="review.todos.length" class="mut">待办：{{ review.todos.join("；") }}</p>
     </div>
 
-    <h3 class="bmtitle">💡 跨卡选题 <button class="mini" :disabled="busy.topics" @click="doGenTopics">{{ busy.topics ? "思考中…" : "AI 碰撞 5 个选题" }}</button></h3>
+    </template>
+<template v-else-if="navTab === 'topics'">
+<h3 class="bmtitle">💡 跨卡选题 <button class="mini" :disabled="busy.topics" @click="doGenTopics">{{ busy.topics ? "思考中…" : "AI 碰撞 5 个选题" }}</button></h3>
     <div v-if="topics.length" class="cardblock">
       <p v-for="(t, i) in topics" :key="i" class="mut" style="margin:6px 0">{{ t }}</p>
     </div>
 
-    <h3 class="bmtitle">✍️ 引用创作（勾 2-5 张卡，AI 照素材写稿）</h3>
+    </template>
+<template v-else-if="navTab === 'quote'">
+<h3 class="bmtitle">✍️ 引用创作（勾 2-5 张卡，AI 照素材写稿）</h3>
     <div class="cardblock">
       <div v-for="c in cards" :key="c.file" class="cardrow" :class="{ picked: picked.has(c.file) }" @click="togglePick(c.file)">
         <input type="checkbox" :checked="picked.has(c.file)" style="pointer-events:none" />
@@ -778,7 +811,9 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       </div>
     </div>
 
-    <div class="cardblock">
+    </template>
+<template v-else-if="navTab === 'wx'">
+<div class="cardblock">
       <h3 class="bmtitle">📥 微信文章采集</h3>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
         <label class="mut" style="font-size:12px;display:inline-flex;align-items:center;gap:4px;margin-right:4px">采集最近
@@ -800,7 +835,9 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <p v-if="!wxArts.length" class="mut" style="font-size:12px">点「抓取浏览记录」读取你在微信里看过的公众号文章（只读本地记录，需 Windows + 微信 4.x）</p>
     </div>
 
-    <div class="cardblock">
+    </template>
+<template v-else-if="navTab === 'watch'">
+<div class="cardblock">
       <h3 class="bmtitle">👀 公众号实时监听</h3>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
         <input v-model="watchNewName" placeholder="公众号名" style="width:110px;font-size:12px" />
@@ -817,7 +854,9 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <p v-if="!watchCfg.targets.length" class="mut" style="font-size:12px">添加关注的公众号后，每 {{ watchCfg.interval_min }} 分钟自动检查新文章 → 存「监听新文」→ 飞书提醒。零 hook、不付费、数据不出你的机器。</p>
     </div>
 
-    <h3 class="bmtitle">⭐ 常用网址</h3>
+    </template>
+<template v-else-if="navTab === 'marks'">
+<h3 class="bmtitle">⭐ 常用网址</h3>
     <div class="bmform">
       <input v-model="bmNew.title" placeholder="名称（可空）" class="bm-title" />
       <input v-model="bmNew.url" placeholder="https://…  网址" class="bm-url" @keyup.enter="addBm" />
@@ -830,6 +869,9 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       </div>
       <p v-if="!bookmarks.length" class="empty2">还没有常用网址</p>
     </div>
+
+  </template>
+    </main>
   </div>
 
   <!-- 设置页 -->
@@ -849,7 +891,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <template v-if="setTab === 'ai'">
       <h3 class="sect">🤖 模型厂商（可配多家并存）</h3>
       <p class="tip">点厂商名展开：填 Key → 获取模型 → 保存。各家独立存 Key，互不冲突。</p>
-      <div v-for="(p, pi) in cfg.providers" :key="pi" class="provcard">
+      <div v-for="(p, pi) in (cfg.providers || [])" :key="pi" class="provcard">
         <div class="provhead" @click="openProv = openProv === pi ? -1 : pi">
           <span class="provname">{{ p.name || ('厂商 ' + (pi+1)) }}</span>
           <span class="provbadge" :class="p.api_key ? 'okb' : ''">{{ p.api_key ? '已配 Key' : '未配 Key' }}</span>
@@ -1165,4 +1207,17 @@ form .ok:hover, .cfgform .ok:hover { background: #06AD56; }
 .kwtag { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: #eef2f7; color: #64748B; cursor: pointer; }
 .kwtag:hover { color: #07C160; }
 .kwtag.on { background: #07C160; color: #fff; }
+/* ===== 左侧菜单布局（v0.9.9）===== */
+.shell { display: flex; flex-direction: row; padding: 0; gap: 0; min-height: 100%; }
+.sidenav { width: 150px; flex-shrink: 0; background: #fff; border-right: 1px solid #e3e6ec; display: flex; flex-direction: column; padding: 12px 8px; }
+.sidehead { display: flex; flex-direction: column; gap: 8px; padding: 0 6px 12px; border-bottom: 1px solid #f0f1f4; margin-bottom: 8px; }
+.sidehead b { font-size: 14px; }
+.sideitem { text-align: left; padding: 8px 12px; border: none; background: transparent; border-radius: 8px; font-size: 13px; cursor: pointer; color: #334155; }
+.sideitem:hover { background: #f0faf4; }
+.sideitem.on { background: #07C160; color: #fff; font-weight: 600; }
+.sidesub { text-align: left; padding: 6px 12px 6px 26px; border: none; background: transparent; font-size: 12px; cursor: pointer; color: #64748B; border-radius: 8px; }
+.sidesub:hover { background: #f0faf4; color: #07C160; }
+.sidesub.on { color: #07C160; font-weight: 600; background: #e8f9ef; }
+.sidefoot { margin-top: auto; border-top: 1px solid #f0f1f4; padding-top: 8px; }
+.sidecontent { flex: 1; min-width: 0; padding: 14px 16px; overflow-y: auto; }
 </style>
