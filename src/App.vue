@@ -289,6 +289,49 @@ async function testConfig() {
 // ---- 设置页标签 ----
 const setTab = ref<"general" | "ai" | "notion" | "feishu">("ai");
 const itgMsg = ref("");
+
+// ---- 微信文章采集（借鉴 wechat-url-capture）----
+interface WxArticle { url: string; title: string; author: string; time: string; visits: number }
+const wxArts = ref<WxArticle[]>([]);
+const wxPicked = ref<Set<string>>(new Set());
+const wxMsg = ref("");
+const wxBusy = ref("");
+function toggleWx(url: string) {
+  const s = new Set(wxPicked.value);
+  if (s.has(url)) s.delete(url); else s.add(url);
+  wxPicked.value = s;
+}
+async function wxScan() {
+  wxBusy.value = "scan"; wxMsg.value = "读取微信浏览记录中…";
+  try {
+    const r = await invoke<{ articles: WxArticle[]; note: string }>("wx_capture", { days: 7 });
+    wxArts.value = r.articles;
+    wxMsg.value = "✅ " + r.note + (r.articles.length ? "，勾选后入库" : "");
+  } catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
+  wxBusy.value = "";
+}
+async function wxSave() {
+  const pickedArts = wxArts.value.filter(a => wxPicked.value.has(a.url));
+  if (!pickedArts.length) { wxMsg.value = "先勾选文章"; return; }
+  wxBusy.value = "save"; wxMsg.value = "入库中…";
+  try { wxMsg.value = "✅ " + await invoke<string>("wx_save_to_inbox", { articles: pickedArts }); loadCards(); }
+  catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
+  wxBusy.value = "";
+}
+async function wxCards() {
+  const pickedArts = wxArts.value.filter(a => wxPicked.value.has(a.url));
+  if (!pickedArts.length) { wxMsg.value = "先勾选文章"; return; }
+  wxBusy.value = "cards"; wxMsg.value = "AI 整理中，可能要等一会…";
+  try { wxMsg.value = "✅ " + await invoke<string>("wx_make_cards", { articles: pickedArts }); loadCards(); }
+  catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
+  wxBusy.value = "";
+}
+async function wxExport() {
+  wxBusy.value = "export"; wxMsg.value = "导出公众号列表中…";
+  try { wxMsg.value = "✅ " + await invoke<string>("wx_export_gzh"); }
+  catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
+  wxBusy.value = "";
+}
 const notionPreviewRows = ref<string[]>([]);
 
 async function saveIntegrations() {
@@ -616,6 +659,23 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
         📄 {{ d.title }} <span class="mut">· {{ d.created }} · 用卡：{{ d.tags }}</span>
         <button class="mini" style="margin-left:8px" @click="pushDraftToNotion(d.file)">📖 推到 Notion</button>
       </div>
+    </div>
+
+    <div class="cardblock">
+      <h3 class="bmtitle" style="margin-top:0">📥 微信文章采集（最近 7 天浏览）</h3>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="mini" :disabled="!!wxBusy" @click="wxScan">{{ wxBusy === 'scan' ? "读取中…" : "🔍 抓取浏览记录" }}</button>
+        <button class="mini ok" :disabled="!!wxBusy || !wxPicked.size" @click="wxSave">📥 存收件箱 ({{ wxPicked.size }})</button>
+        <button class="mini ok" :disabled="!!wxBusy || !wxPicked.size" @click="wxCards">🤖 AI 成卡 ({{ wxPicked.size }})</button>
+        <button class="mini" :disabled="!!wxBusy" @click="wxExport" title="导出公众号列表 JSON，供评论寻客导入">📤 导出公众号</button>
+      </div>
+      <p v-if="wxMsg" class="mut" style="font-size:12px;margin:4px 0">{{ wxMsg }}</p>
+      <div v-for="a in wxArts" :key="a.url" class="mut" style="margin:4px 0;font-size:12px;display:flex;align-items:center;gap:6px">
+        <input type="checkbox" :checked="wxPicked.has(a.url)" @change="toggleWx(a.url)" style="margin:0" />
+        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="a.title">📰 {{ a.title }}</span>
+        <span class="mut" style="white-space:nowrap">{{ a.author || '未知号' }} · {{ a.time }}</span>
+      </div>
+      <p v-if="!wxArts.length" class="mut" style="font-size:12px">点「抓取浏览记录」读取你在微信里看过的公众号文章（只读本地记录，需 Windows + 微信 4.x）</p>
     </div>
 
     <h3 class="bmtitle">⭐ 常用网址</h3>

@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 mod integrations;
+mod wechat_capture;
 
 #[derive(Serialize, Clone)]
 pub struct Item {
@@ -113,7 +114,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn sanitize(s: &str) -> String {
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')).take(40).collect()
 }
 
@@ -530,7 +531,9 @@ pub fn run() {
             integrations::notion_test, integrations::notion_preview,
             integrations::save_integrations,
             integrations::notion_sync_to_cards, integrations::push_draft_to_notion,
-            integrations::feishu_push_weekly
+            integrations::feishu_push_weekly,
+            wechat_capture::wx_capture, wechat_capture::wx_save_to_inbox,
+            wechat_capture::wx_make_cards, wechat_capture::wx_export_gzh
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
@@ -684,7 +687,7 @@ fn list_cards(state: State<PetState>) -> Vec<CardItem> {
     scan_cards(&state.kb_dir.lock().unwrap().clone())
 }
 
-async fn ai_chat(cfg: &AiConfig, prompt: &str) -> Result<String, String> {
+pub(crate) async fn ai_chat(cfg: &AiConfig, prompt: &str) -> Result<String, String> {
     if cfg.api_key.is_empty() || cfg.base_url.is_empty() { return Err("请先在设置里配置 API".into()); }
     let cli = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
     let resp = cli.post(format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')))
