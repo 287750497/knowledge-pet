@@ -373,42 +373,52 @@ interface WxArticle { url: string; title: string; author: string; time: string; 
 const wxDays = ref(7);
 const wxArts = ref<WxArticle[]>([]);
 const wxPicked = ref<Set<string>>(new Set());
-const wxMsg = ref("");
-const wxBusy = ref("");
+const wxMsg = ref(""); const wxBusy = ref(""); const wxProgPct = ref(0);
+let wxProgTimer: any = null;
+function wxProgStart(total: number) {
+  wxProgPct.value = total > 0 ? 1 : 0;
+  if (total > 0) {
+    const step = 100 / Math.max(total, 1);
+    if (wxProgTimer) clearInterval(wxProgTimer);
+    wxProgTimer = window.setInterval(() => { wxProgPct.value = Math.min(99, wxProgPct.value + step); }, 300);
+  }
+}
+function wxProgDone() { if (wxProgTimer) clearInterval(wxProgTimer); wxProgPct.value = 100; setTimeout(() => { wxProgPct.value = 0; }, 600); }
 function toggleWx(url: string) {
   const s = new Set(wxPicked.value);
   if (s.has(url)) s.delete(url); else s.add(url);
   wxPicked.value = s;
 }
 async function wxScan() {
-  wxBusy.value = "scan"; wxMsg.value = "读取微信浏览记录中…";
+  wxBusy.value = "scan"; wxMsg.value = "读取微信浏览记录中…"; wxProgStart(0);
   try {
     const r = await invoke<{ articles: WxArticle[]; note: string }>("wx_capture", { days: wxDays.value || 7 });
     wxArts.value = r.articles;
-    wxMsg.value = "✅ " + r.note + (r.articles.length ? "，勾选后入库" : "");
-  } catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
+    wxMsg.value = r.articles.length ? ("✅ " + r.note + "，勾选后入库") : ("⚠️ " + r.note);
+    wxProgDone();
+  } catch (e) { wxMsg.value = "❌ 读取失败：" + String(e).slice(0, 160); wxProgDone(); }
   wxBusy.value = "";
 }
 async function wxSave() {
   const pickedArts = wxArts.value.filter(a => wxPicked.value.has(a.url));
   if (!pickedArts.length) { wxMsg.value = "先勾选文章"; return; }
-  wxBusy.value = "save"; wxMsg.value = "入库中…";
+  wxBusy.value = "save"; wxMsg.value = `入库中… 0/${pickedArts.length}`; wxProgStart(pickedArts.length);
   try { wxMsg.value = "✅ " + await invoke<string>("wx_save_to_inbox", { articles: pickedArts }); loadCards(); }
-  catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
+  catch (e) { wxMsg.value = "❌ 入库失败：" + String(e).slice(0, 160); wxProgDone(); }
   wxBusy.value = "";
 }
 async function wxCards() {
   const pickedArts = wxArts.value.filter(a => wxPicked.value.has(a.url));
   if (!pickedArts.length) { wxMsg.value = "先勾选文章"; return; }
-  wxBusy.value = "cards"; wxMsg.value = "AI 整理中，可能要等一会…";
+  wxBusy.value = "cards"; wxMsg.value = `AI 整理中 0/${pickedArts.length}，可能要等一会…`; wxProgStart(pickedArts.length);
   try { wxMsg.value = "✅ " + await invoke<string>("wx_make_cards", { articles: pickedArts }); loadCards(); }
-  catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
+  catch (e) { wxMsg.value = "❌ 成卡失败：" + String(e).slice(0, 160); wxProgDone(); }
   wxBusy.value = "";
 }
 async function wxExport() {
-  wxBusy.value = "export"; wxMsg.value = "导出公众号列表中…";
+  wxBusy.value = "export"; wxMsg.value = "导出公众号列表中…"; wxProgStart(0);
   try { wxMsg.value = "✅ " + await invoke<string>("wx_export_gzh"); }
-  catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
+  catch (e) { wxMsg.value = "❌ 导出失败：" + String(e).slice(0, 160); wxProgDone(); }
   wxBusy.value = "";
 }
 // ---- 公众号实时监听（v0.9，零 hook 零订阅）----
@@ -830,7 +840,8 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
         <button class="mini ok" :disabled="!!wxBusy || !wxPicked.size" @click="wxCards">🤖 AI 成卡 ({{ wxPicked.size }})</button>
         <button class="mini" :disabled="!!wxBusy" @click="wxExport" title="导出公众号列表 JSON，供评论寻客导入">📤 导出公众号</button>
       </div>
-      <p v-if="wxMsg" class="mut" style="font-size:12px;margin:4px 0">{{ wxMsg }}</p>
+      <div v-if="wxBusy" class="wxprog"><div class="wxprog-in" :style="{ width: wxProgPct > 0 ? wxProgPct + '%' : '40%' }" :class="{ indet: wxProgPct === 0 }"></div></div>
+      <p v-if="wxMsg" class="wxmsg" :class="wxMsg.startsWith('❌') ? 'err' : wxMsg.startsWith('✅') ? 'ok' : 'busy'">{{ wxMsg }}</p>
       <div v-for="a in wxArts" :key="a.url" class="mut" style="margin:4px 0;font-size:12px;display:flex;align-items:center;gap:6px">
         <input type="checkbox" :checked="wxPicked.has(a.url)" @change="toggleWx(a.url)" style="margin:0" />
         <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="a.title">📰 {{ a.title }}</span>
@@ -1235,4 +1246,13 @@ form .ok:hover, .cfgform .ok:hover { background: #06AD56; }
 .sidesub.on { color: #07C160; font-weight: 600; background: #e8f9ef; }
 .sidefoot { margin-top: auto; border-top: 1px solid #f0f1f4; padding-top: 8px; }
 .sidecontent { flex: 1; min-width: 0; padding: 14px 16px; overflow-y: auto; }
+/* wx 采集进度/消息（v0.9.11）*/
+.wxprog { height: 5px; background: #eef0f4; border-radius: 99px; overflow: hidden; margin: 6px 0; }
+.wxprog-in { height: 100%; background: #07C160; border-radius: 99px; transition: width .25s; }
+.wxprog-in.indet { width: 40% !important; animation: wxindet 1.1s infinite ease-in-out; }
+@keyframes wxindet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+.wxmsg { font-size: 12px; margin: 4px 0; font-weight: 600; }
+.wxmsg.err { color: #e5484d; }
+.wxmsg.ok { color: #07C160; }
+.wxmsg.busy { color: #3b82f6; }
 </style>
