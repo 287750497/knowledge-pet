@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 mod integrations;
 mod wechat_capture;
+mod watch;
 
 #[derive(Serialize, Clone)]
 pub struct Item {
@@ -533,7 +534,10 @@ pub fn run() {
             integrations::notion_sync_to_cards, integrations::push_draft_to_notion,
             integrations::feishu_push_weekly,
             wechat_capture::wx_capture, wechat_capture::wx_save_to_inbox,
-            wechat_capture::wx_make_cards, wechat_capture::wx_export_gzh
+            wechat_capture::wx_make_cards, wechat_capture::wx_export_gzh,
+            watch::watch_list, watch::watch_add, watch::watch_remove,
+            watch::watch_set, watch::watch_import_from_capture,
+            watch::watch_check, watch::watch_auto_tick
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};

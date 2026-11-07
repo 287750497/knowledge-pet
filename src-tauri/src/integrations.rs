@@ -26,6 +26,14 @@ async fn feishu_send_text(webhook: &str, text: &str) -> Result<String, String> {
     if code == 0 { Ok(msg.to_string()) } else { Err(format!("飞书错误({code}): {msg}")) }
 }
 
+pub(crate) async fn feishu_send_raw(webhook: &str, text: &str) -> Result<String, String> {
+    feishu_send_text(webhook, text).await
+}
+
+pub(crate) fn feishu_webhook_of(cfg: &crate::AiConfig) -> String {
+    cfg.feishu_webhook.clone()
+}
+
 #[tauri::command]
 pub async fn feishu_test(state: State<'_, PetState>) -> Result<String, String> {
     let wh = state.config.lock().unwrap().feishu_webhook.clone();

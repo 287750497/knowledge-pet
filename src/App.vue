@@ -108,17 +108,23 @@ async function petClick() {
   }
 }
 
+let dragTimer: number | undefined;
 function petDrag(e: PointerEvent) {
-  // 按住宠物/把手=系统拖拽，可移到桌面任何位置；双击=面板；右键=菜单
+  // 按住（220ms 未抬手）=系统拖拽；快速单击/双击则取消拖拽让 dblclick 生效
   if (e.button !== 0) return;
-  isDragging.value = true;
-  (async () => {
-    try {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().startDragging();
-    } catch {}
-    setTimeout(() => { isDragging.value = false; }, 300);
-  })();
+  clearTimeout(dragTimer);
+  dragTimer = window.setTimeout(() => {
+    isDragging.value = true;
+    (async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        await getCurrentWindow().startDragging();
+      } catch {}
+      setTimeout(() => { isDragging.value = false; }, 300);
+    })();
+  }, 220);
+  const cancel = () => { clearTimeout(dragTimer); window.removeEventListener("pointerup", cancel); };
+  window.addEventListener("pointerup", cancel);
 }
 
 async function bowlClick() {
@@ -332,7 +338,45 @@ async function wxExport() {
   catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
   wxBusy.value = "";
 }
+// ---- 公众号实时监听（v0.9，零 hook 零订阅）----
+interface WatchTarget { name: string; biz: string }
+const watchCfg = ref<{ targets: WatchTarget[]; interval_min: number; fetch_content: boolean; feishu_notify: boolean }>({ targets: [], interval_min: 30, fetch_content: true, feishu_notify: true });
+const watchNewName = ref(""); const watchNewBiz = ref("");
+const watchMsg = ref(""); const watchBusy = ref(false);
+async function loadWatch() {
+  try { watchCfg.value = await invoke("watch_list"); } catch {}
+}
+async function watchAdd() {
+  if (!watchNewBiz.value.trim()) { watchMsg.value = "biz 不能为空"; return; }
+  watchBusy.value = true;
+  try { watchMsg.value = "✅ " + await invoke<string>("watch_add", { name: watchNewName.value || "公众号", biz: watchNewBiz.value }); watchNewName.value = ""; watchNewBiz.value = ""; loadWatch(); }
+  catch (e) { watchMsg.value = "❌ " + String(e).slice(0, 160); }
+  watchBusy.value = false;
+}
+async function watchRemove(biz: string) {
+  try { watchMsg.value = await invoke<string>("watch_remove", { biz }); loadWatch(); } catch (e) { watchMsg.value = "❌ " + String(e).slice(0, 160); }
+}
+async function watchImport() {
+  watchBusy.value = true; watchMsg.value = "从浏览记录导入中…";
+  try { watchMsg.value = "✅ " + await invoke<string>("watch_import_from_capture"); loadWatch(); }
+  catch (e) { watchMsg.value = "❌ " + String(e).slice(0, 160); }
+  watchBusy.value = false;
+}
+async function watchCheck() {
+  watchBusy.value = true; watchMsg.value = "检查新文章中…";
+  try { const r = await invoke<{ checked: number; found: string[]; note: string }>("watch_check");
+    watchMsg.value = r.found.length ? "✅ 发现 " + r.found.length + " 篇新文：" + r.found.join("、") : "✅ 检查 " + r.checked + " 个号，无新文" + (r.note ? "（" + r.note + "）" : ""); }
+  catch (e) { watchMsg.value = "❌ " + String(e).slice(0, 160); }
+  watchBusy.value = false;
+}
+// 自动轮询：每 interval_min 分钟一次
+let watchTimer: number | undefined;
+onMounted(async () => {
+  loadWatch();
+  try { const c = await invoke("watch_list"); const cfg = c as any; clearInterval(watchTimer); watchTimer = window.setInterval(async () => { try { await invoke("watch_auto_tick"); } catch {} }, Math.max(5, cfg.interval_min || 30) * 60000); } catch {}
+});
 const notionPreviewRows = ref<string[]>([]);
+
 
 async function saveIntegrations() {
   try {
@@ -514,11 +558,11 @@ async function openPanel() {
     if (cur.label === "pet") {
       const { Window } = await import("@tauri-apps/api/window");
       const main = await Window.getByLabel("main");
-      if (main) { await main.show(); await main.setFocus();
-        // main 窗之前被「回到桌宠」切到 pet 视图，重新拉起时让它回到面板
-        const { emitTo } = await import("@tauri-apps/api/event");
-        await emitTo("main", "switch-view", "panel").catch(() => {});
-      }
+      if (main) {
+        try { await main.show(); } catch (e) { showBubble("show: " + String(e).slice(0, 60)); }
+        try { await main.setFocus(); } catch (e) { showBubble("focus: " + String(e).slice(0, 60)); }
+        try { const { emitTo } = await import("@tauri-apps/api/event"); await emitTo("main", "switch-view", "panel"); } catch (e) { showBubble("emit: " + String(e).slice(0, 60)); }
+      } else { showBubble("main 窗未找到"); }
       await cur.hide();
       return;
     }
@@ -678,6 +722,23 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <p v-if="!wxArts.length" class="mut" style="font-size:12px">点「抓取浏览记录」读取你在微信里看过的公众号文章（只读本地记录，需 Windows + 微信 4.x）</p>
     </div>
 
+    <div class="cardblock">
+      <h3 class="bmtitle" style="margin-top:0">👀 公众号实时监听</h3>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <input v-model="watchNewName" placeholder="公众号名" style="width:110px;font-size:12px" />
+        <input v-model="watchNewBiz" placeholder="biz（__biz= 参数）" style="width:170px;font-size:12px" @keyup.enter="watchAdd" />
+        <button class="mini ok" :disabled="watchBusy" @click="watchAdd">➕ 添加</button>
+        <button class="mini" :disabled="watchBusy" @click="watchImport" title="从 v0.8 浏览记录一键导入（Windows）">📥 从浏览记录导入</button>
+        <button class="mini ok" :disabled="watchBusy" @click="watchCheck">🔍 立即检查新文</button>
+      </div>
+      <p v-if="watchMsg" class="mut" style="font-size:12px;margin:4px 0">{{ watchMsg }}</p>
+      <div v-for="t in watchCfg.targets" :key="t.biz" class="mut" style="margin:4px 0;font-size:12px;display:flex;align-items:center;gap:6px">
+        <span style="flex:1">👀 {{ t.name }} <span class="mut">({{ t.biz.slice(0, 14) }}…)</span></span>
+        <button class="mini" @click="watchRemove(t.biz)">移除</button>
+      </div>
+      <p v-if="!watchCfg.targets.length" class="mut" style="font-size:12px">添加关注的公众号后，每 {{ watchCfg.interval_min }} 分钟自动检查新文章 → 存「监听新文」→ 飞书提醒。零 hook、不付费、数据不出你的机器。</p>
+    </div>
+
     <h3 class="bmtitle">⭐ 常用网址</h3>
     <div class="bmform">
       <input v-model="bmNew.title" placeholder="名称（可空）" class="bm-title" />
@@ -818,7 +879,8 @@ body { font-family: system-ui, "Microsoft YaHei"; overflow: hidden; }
 .drag-handle .dots { font-size: 12px; color: rgba(255,255,255,.75); line-height: 1; }
 .petrow { display: flex; align-items: flex-end; gap: 6px; }
 /* 右键菜单 */
-.pet-menu { position: absolute; top: 22px; left: 10px; z-index: 50; background: #fffdf9; border: 1px solid rgba(90,60,30,.08); border-radius: 14px; box-shadow: 0 6px 0 rgba(90,60,30,.06), 0 10px 28px rgba(60,40,20,.18); padding: 6px; display: flex; flex-direction: column; min-width: 150px; transform-origin: 18px 0; animation: menuIn .22s cubic-bezier(.2,.8,.3,1); }
+.pet-menu { position: absolute; bottom: 24px; left: 10px; max-height: calc(100vh - 30px); overflow-y: auto; z-index: 50; background: #fffdf9; border: 1px solid rgba(90,60,30,.08); border-radius: 14px; box-shadow: 0 6px 0 rgba(90,60,30,.06), 0 10px 28px rgba(60,40,20,.18); padding: 6px; display: flex; flex-direction: column; min-width: 150px; transform-origin: 18px 100%; animation: menuUp .22s cubic-bezier(.2,.8,.3,1); }
+@keyframes menuUp { from { opacity: 0; transform: translateY(4px) scale(.97); } to { opacity: 1; transform: none; } }
 @keyframes menuIn { from { opacity: 0; transform: translateY(-4px) scale(.97); } to { opacity: 1; transform: none; } }
 .pet-menu button { border: 0; background: none; text-align: left; padding: 8px 12px; font-size: 13px; border-radius: 9px; cursor: pointer; color: #4a3a2a; opacity: 0; animation: menuItemIn .22s ease-out forwards; transition: background-color .12s ease-out; }
 .pet-menu button:nth-child(1) { animation-delay: 0ms; } .pet-menu button:nth-child(2) { animation-delay: 30ms; }

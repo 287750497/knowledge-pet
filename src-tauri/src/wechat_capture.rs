@@ -82,7 +82,7 @@ fn is_useful(url: &str) -> bool {
 }
 
 // 公众号文章 URL 去重键：__biz+mid+idx+sn 四元组 / /s/xxx / 原样小写
-fn key_of(url: &str) -> String {
+pub(crate) fn key_of(url: &str) -> String {
     let mut u = url.trim().to_string();
     if let Some(h) = u.find('#') { u.truncate(h); }
     let get = |k: &str| -> Option<String> {
@@ -139,7 +139,11 @@ pub async fn wx_capture(state: tauri::State<'_, crate::PetState>, days: Option<u
     Ok(result)
 }
 
-fn capture_sync(root: &Path, days: u32) -> CaptureResult {
+pub(crate) fn capture_sync_public(root: &Path, days: u32) -> Vec<WxArticle> { capture_sync(root, days).articles }
+
+pub(crate) fn profiles_root_public() -> Option<PathBuf> { profiles_root() }
+
+pub(crate) fn capture_sync(root: &Path, days: u32) -> CaptureResult {
     let Some(hist) = newest_file(root, "History") else {
         return CaptureResult { articles: vec![], note: "未找到 multitab_*/History 历史库".into() };
     };
