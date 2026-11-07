@@ -153,16 +153,18 @@ function showBubble(msg: string) {
 }
 
 async function crawlAll() {
-  showBubble("🕷️ 开始抓取网页…");
+  showBubble("🕷️ 开始抓取网页…（每篇间隔 3 秒防限流）");
   for (let i = 0; i < 20; i++) {
     try {
       const msg = await invoke<string>("process_queue");
       showBubble("✓ " + msg);
+      await new Promise(r => setTimeout(r, 3000)); // 防微信限流（数海丹心教训）
     } catch (e) {
       if (String(e).includes("队列空")) break;
       showBubble("⚠️ " + String(e));
     }
   }
+  showBubble("✅ 队列抓取完毕");
   refresh();
 }
 

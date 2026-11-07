@@ -323,9 +323,24 @@ async fn process_queue(state: State<'_, PetState>) -> Result<String, String> {
     eprintln!("[pet] html len={}", html.len());
     let (title, content) = extract_article(&html);
     eprintln!("[pet] extracted title={:?} content_len={} writing...", title, content.len());
-    // 每篇文章单独文件夹：10-inbox/<日期-标题>/index.md + images/（各就各位，借鉴数海丹心下载工具）
-    let folder_name = sanitize(&format!("{}-{}", chrono_today(), title.chars().take(40).collect::<String>()));
-    let dir = kb.join("10-inbox").join(&folder_name);
+    // 每篇文章单独文件夹：10-inbox/[作者/]日期-标题/index.md + images/（借鉴数海丹心下载工具+AISet 素材库按作者归档）
+    // 微信文章从 html 里抠公众号名（var nickname = "xx" 或 window.nickname）
+    let author = html.find("nickname").and_then(|p| {
+        let seg = &html[p..(p + 120).min(html.len())];
+        // nickname = "xx" 或 nickname: "xx" —— 跳过 = / : 后找引号
+        let after = seg.find(|c| c == '=' || c == ':')?;
+        let rest = &seg[after..];
+        let q1 = rest.find('"')?; let rest2 = &rest[q1 + 1..]; let q2 = rest2.find('"')?;
+        let n = rest2[..q2].trim();
+        (!n.is_empty() && n.len() < 60).then(|| n.to_string())
+    }).unwrap_or_default();
+    let folder_rel = if author.is_empty() {
+        sanitize(&format!("{}-{}", chrono_today(), title.chars().take(40).collect::<String>()))
+    } else {
+        format!("{}/{}", sanitize(&author), sanitize(&format!("{}-{}", chrono_today(), title.chars().take(40).collect::<String>())))
+    };
+    let dir = kb.join("10-inbox").join(&folder_rel);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // 下载文中图片（还原懒加载 data-src），失败不阻塞
     let img_dir = dir.join("images");
@@ -360,10 +375,17 @@ async fn process_queue(state: State<'_, PetState>) -> Result<String, String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
-    let new_text = format!(
-        "---\nkind: url\nurl: {}\nstatus: fetched\ncreated: {}\n---\n\n# {}\n\n> 来源：{}\n> 附件：images/ 共 {} 张\n\n{}",
-        url, chrono_today(), title, url, saved_imgs, content
-    );
+    let new_text = if author.is_empty() {
+        format!(
+            "---\nkind: url\nurl: {}\nstatus: fetched\ncreated: {}\n---\n\n# {}\n\n> 来源：{}\n> 附件：images/ 共 {} 张\n\n{}",
+            url, chrono_today(), title, url, saved_imgs, content
+        )
+    } else {
+        format!(
+            "---\nkind: url\nurl: {}\nauthor: {}\nstatus: fetched\ncreated: {}\n---\n\n# {}\n\n> 来源：{}（{}）\n> 附件：images/ 共 {} 张\n\n{}",
+            url, author, chrono_today(), title, url, author, saved_imgs, content
+        )
+    };
     fs::write(dir.join("index.md"), &new_text).map_err(|e| { eprintln!("[pet] write err: {}", e); e.to_string() })?;
     // 删掉旧的 seed 占位文件（scan_items 会把文件夹下的 index.md 当新条目）
     let _ = fs::remove_file(&path);
@@ -994,6 +1016,22 @@ mod v095_tests {
         assert_eq!(sub.status, "fetched");
         assert!(sub.file.starts_with("10-inbox/2026-11-07-测试文章/index.md"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_nickname_extract() {
+        let html = r#"<script>var nickname = "前端晚自习"; var biz = "x";</script>"#;
+        let p = html.find("nickname").unwrap();
+        let seg = &html[p..(p + 120).min(html.len())];
+        let after = seg.find(|c| c == '=' || c == ':').unwrap();
+        let rest = &seg[after..];
+        let q1 = rest.find('"').unwrap(); let rest2 = &rest[q1 + 1..]; let q2 = rest2.find('"').unwrap();
+        assert_eq!(rest2[..q2].trim(), "前端晚自习");
+        // nickname 出现在无赋值上下文（如 css class）时不应误抠
+        let html2 = r#"<div class="nickname">正文</div>"#;
+        let seg2 = &html2[html2.find("nickname").unwrap()..];
+        let no_assign = seg2.find(|c| c == '=' || c == ':').is_none();
+        assert!(no_assign);
     }
 
     #[test]
