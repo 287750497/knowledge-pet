@@ -292,7 +292,6 @@ async function saveConfig() {
     imageModel: cfg.value.image_model,
   });
   showBubble("✓ 设置已保存");
-  view.value = "panel";
 }
 
 async function testConfig() {
@@ -328,6 +327,7 @@ async function capturePaste() {
 const setTab = ref<"general" | "ai" | "notion" | "feishu">("ai");
 interface ModelEntry { id: string; kind: string }
 const modelsList = ref<ModelEntry[]>([]);
+const modelSearch = ref("");
 const modelsBusy = ref(false);
 const modelsMsg = ref("");
 const openProv = ref(-1);
@@ -341,6 +341,10 @@ function delProvider(pi: number) {
   if (cfg.value.active_provider >= cfg.value.providers.length) cfg.value.active_provider = 0;
   if (cfg.value.image_provider === pi) cfg.value.image_provider = -1;
 }
+const filteredModels = computed(() => {
+  const q = modelSearch.value.trim().toLowerCase();
+  return q ? modelsList.value.filter(m => m.id.toLowerCase().includes(q)) : modelsList.value;
+});
 function pickModel(pi: number, mm: ModelEntry) {
   const p = cfg.value.providers[pi];
   if (mm.kind === "image") { p.image_model = mm.id; cfg.value.image_provider = pi; cfg.value.image_model = mm.id; }
@@ -915,10 +919,14 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
             <button type="button" class="mini" :disabled="modelsBusy" @click="fetchModels(pi)">{{ modelsBusy ? "获取中…" : "⟳ 获取模型" }}</button>
           </div>
           <div v-if="modelsList.length" class="modellist">
-            <div v-for="mm in modelsList" :key="mm.id" class="modelitem" @click="pickModel(pi, mm)">
-              <span>{{ mm.kind === 'image' ? '🖼️' : '📝' }} {{ mm.id }}</span>
-              <span class="mut" style="font-size:11px">{{ mm.kind === 'image' ? '图片' : '文本' }}</span>
+            <input v-model="modelSearch" class="msearch" placeholder="🔍 查找模型…" />
+            <div class="mcount">{{ filteredModels.length }} / {{ modelsList.length }} 个模型</div>
+            <div v-for="mm in filteredModels" :key="mm.id" class="modelitem" @click="pickModel(pi, mm)">
+              <span class="mname">{{ mm.id }}</span>
+              <span v-if="mm.kind === 'image'" class="imgtag">🖼 图片</span>
+              <span v-else class="txttag">📝</span>
             </div>
+            <p v-if="!filteredModels.length" class="mut" style="padding:8px 10px;font-size:12px">没有匹配的模型</p>
           </div>
           <p v-if="modelsMsg" class="mut" style="font-size:12px;margin:4px 0">{{ modelsMsg }}</p>
         </div>
@@ -1174,7 +1182,7 @@ form > .sect:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
 .notionpreview li:last-child { border-bottom: 0; }
 .tip { font-size: 12px; color: #94A3B8; margin: 12px 0; }
 .tip.err { color: #B91C1C; }
-.cfgform { max-width: 480px; display: flex; flex-direction: column; margin: 0 20px; }
+.cfgform { max-width: none; width: calc(100% - 32px); display: flex; flex-direction: column; margin: 0 16px; }
 .cfgform label { font-size: 12.5px; color: #64748B; margin: 10px 0 4px; }
 /* 知识卡工坊 */
 .cardrow { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border-radius: 8px; cursor: pointer; transition: background .1s; }
@@ -1188,9 +1196,16 @@ form > .sect:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
 form .ok, .cfgform .ok { background: #07C160; border-color: #07C160; color: #fff; }
 form .ok:hover, .cfgform .ok:hover { background: #06AD56; }
 /* 获取模型弹层 */
-.modellist { max-height: 180px; overflow-y: auto; border: 1px solid #d9dce3; border-radius: 8px; background: #fff; margin-top: 4px; box-shadow: 0 4px 14px rgba(0,0,0,.08); }
-.modelitem { padding: 6px 10px; font-size: 12px; cursor: pointer; border-bottom: 1px solid #f0f1f4; }
-.modelitem:hover { background: #e8f9ef; color: #07C160; }
+.modellist { max-height: 240px; overflow-y: auto; border: 1px solid #d9dce3; border-radius: 10px; background: #fff; margin-top: 6px; box-shadow: 0 4px 14px rgba(0,0,0,.08); }
+.msearch { width: calc(100% - 20px); margin: 10px 10px 2px; padding: 7px 10px; font-size: 12px; border: 1px solid #e3e6ec; border-radius: 8px; outline: none; background: #f7f8fa; }
+.msearch:focus { border-color: #07C160; background: #fff; }
+.mcount { padding: 2px 12px 6px; font-size: 11px; color: #94a3b8; }
+.modelitem { display: flex; align-items: center; gap: 8px; padding: 7px 12px; font-size: 12px; cursor: pointer; border-bottom: 1px solid #f0f1f4; justify-content: flex-start; }
+.modelitem:hover { background: #e8f9ef; }
+.mname { flex: 0 1 auto; text-align: left; font-family: Menlo, Consolas, monospace; color: #1f2937; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modelitem:hover .mname { color: #07C160; }
+.imgtag { flex-shrink: 0; font-size: 10px; background: #fff4e5; color: #d97706; border: 1px solid #fcd9a0; padding: 1px 6px; border-radius: 99px; }
+.txttag { flex-shrink: 0; font-size: 11px; color: #cbd5e1; }
 /* 厂商卡片 */
 .provcard { border: 1px solid #e3e6ec; border-radius: 10px; background: #fff; margin-bottom: 8px; overflow: hidden; }
 .provhead { display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: pointer; font-weight: 600; }
