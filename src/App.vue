@@ -298,6 +298,7 @@ const itgMsg = ref("");
 
 // ---- 微信文章采集（借鉴 wechat-url-capture）----
 interface WxArticle { url: string; title: string; author: string; time: string; visits: number }
+const wxDays = ref(7);
 const wxArts = ref<WxArticle[]>([]);
 const wxPicked = ref<Set<string>>(new Set());
 const wxMsg = ref("");
@@ -310,7 +311,7 @@ function toggleWx(url: string) {
 async function wxScan() {
   wxBusy.value = "scan"; wxMsg.value = "读取微信浏览记录中…";
   try {
-    const r = await invoke<{ articles: WxArticle[]; note: string }>("wx_capture", { days: 7 });
+    const r = await invoke<{ articles: WxArticle[]; note: string }>("wx_capture", { days: wxDays.value || 7 });
     wxArts.value = r.articles;
     wxMsg.value = "✅ " + r.note + (r.articles.length ? "，勾选后入库" : "");
   } catch (e) { wxMsg.value = "❌ " + String(e).slice(0, 160); }
@@ -706,8 +707,13 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
     </div>
 
     <div class="cardblock">
-      <h3 class="bmtitle">📥 微信文章采集（最近 7 天浏览）</h3>
+      <h3 class="bmtitle">📥 微信文章采集</h3>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <label class="mut" style="font-size:12px;display:inline-flex;align-items:center;gap:4px;margin-right:4px">采集最近
+        <select v-model.number="wxDays" style="font-size:12px;padding:1px 4px">
+          <option :value="1">1 天</option><option :value="3">3 天</option><option :value="7">7 天</option>
+          <option :value="14">14 天</option><option :value="30">30 天</option><option :value="90">90 天</option>
+        </select> 浏览</label>
         <button class="mini" :disabled="!!wxBusy" @click="wxScan">{{ wxBusy === 'scan' ? "读取中…" : "🔍 抓取浏览记录" }}</button>
         <button class="mini ok" :disabled="!!wxBusy || !wxPicked.size" @click="wxSave">📥 存收件箱 ({{ wxPicked.size }})</button>
         <button class="mini ok" :disabled="!!wxBusy || !wxPicked.size" @click="wxCards">🤖 AI 成卡 ({{ wxPicked.size }})</button>
