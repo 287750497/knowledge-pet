@@ -39,18 +39,80 @@ fn resolve_root(explicit: Option<&str>) -> Option<PathBuf> {
     profiles_root()
 }
 
-// 取最新的 multitab_*/History（按修改时间）
-fn newest_file(root: &Path, name: &str) -> Option<PathBuf> {
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+// profile 目录（multitab_xxx / webview_xxx / web_shell / game ...）全都要扫，
+// 只挑"最新一个"会撞上空模板库或多账号的别人的库。
+fn profile_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut v = Vec::new();
     if let Ok(rd) = fs::read_dir(root) {
         for d in rd.filter_map(|e| e.ok()) {
-            let f = d.path().join(name);
-            if !f.exists() { continue; }
-            let t = fs::metadata(&f).and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            if best.as_ref().map(|(bt, _)| t > *bt).unwrap_or(true) { best = Some((t, f)); }
+            let p = d.path();
+            if p.is_dir() { v.push(p); }
         }
     }
-    best.map(|(_, p)| p)
+    v
+}
+
+// 所有 profile 下同名文件，按体积从大到小（数据多的先读）
+fn all_files(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = profile_dirs(root).into_iter().map(|d| d.join(name)).filter(|p| p.exists()).collect();
+    v.sort_by_key(|p| std::cmp::Reverse(fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
+    v
+}
+
+// 明文 SQLite 才认；微信 4.x 新版本把 History 整库加密了（文件头不是 "SQLite format 3"）
+fn is_sqlite(p: &Path) -> bool {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    match fs::File::open(p).and_then(|mut f| f.read_exact(&mut b)) {
+        Ok(_) => &b[..15] == b"SQLite format 3",
+        Err(_) => false,
+    }
+}
+
+// unix 秒 → "yyyy-MM-dd HH:MM"
+fn unix_to_local(ts: i64) -> String {
+    if ts <= 0 { return String::new(); }
+    chrono::Local.timestamp_opt(ts, 0).single()
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+// 微信文章 real_url 里的 clicktime= 就是点开时间（unix 秒）
+fn clicktime_of(url: &str) -> Option<i64> {
+    url.split(['?', '&']).find_map(|p| {
+        p.strip_prefix("clicktime=").and_then(|v| v.split('&').next()).and_then(|v| v.parse::<i64>().ok())
+    }).filter(|t| *t > 1_500_000_000 && *t < 2_500_000_000)
+}
+
+// Share Data 表没有时间列，但 id 与时间单调相关：用有 clicktime 的行做锚点插值
+fn est_time(anchors: &[(i64, i64)], id: i64) -> Option<i64> {
+    if anchors.is_empty() { return None; }
+    match anchors.binary_search_by_key(&id, |x| x.0) {
+        Ok(i) => Some(anchors[i].1),
+        Err(0) => Some(anchors[0].1),
+        Err(n) if n >= anchors.len() => Some(anchors[anchors.len() - 1].1),
+        Err(n) => {
+            let (i0, t0) = anchors[n - 1];
+            let (i1, t1) = anchors[n];
+            if i1 == i0 { return Some(t0); }
+            let f = (id - i0) as f64 / (i1 - i0) as f64;
+            Some(t0 + ((t1 - t0) as f64 * f) as i64)
+        }
+    }
+}
+
+// 同一篇文章多来源合并：作者/标题非空优先，时间取更晚的
+fn upsert(map: &mut std::collections::HashMap<String, WxArticle>, url: String, title: String, author: String, time: String, visits: u32) {
+    let k = key_of(&url);
+    match map.get_mut(&k) {
+        Some(a) => {
+            if a.author.is_empty() && !author.is_empty() { a.author = author.clone(); }
+            if (a.title.is_empty() || a.title == "(无标题)") && !title.is_empty() { a.title = title.clone(); }
+            if time > a.time { a.time = time; }
+            if visits > a.visits { a.visits = visits; }
+        }
+        None => { map.insert(k, WxArticle { url, title: if title.is_empty() { "(无标题)".into() } else { title }, author, time, visits }); }
+    }
 }
 
 // 数据库被微信锁着 → 复制到临时目录再读
@@ -144,74 +206,94 @@ pub(crate) fn capture_sync_public(root: &Path, days: u32) -> Vec<WxArticle> { ca
 pub(crate) fn profiles_root_public() -> Option<PathBuf> { profiles_root() }
 
 pub(crate) fn capture_sync(root: &Path, days: u32) -> CaptureResult {
-    let Some(hist) = newest_file(root, "History") else {
-        return CaptureResult { articles: vec![], note: "未找到 multitab_*/History 历史库".into() };
-    };
-    let tmp = match copy_db(&hist) { Ok(t) => t, Err(e) => return CaptureResult { articles: vec![], note: e } };
-    let conn = match rusqlite::Connection::open(&tmp) {
-        Ok(c) => c, Err(e) => { let _ = fs::remove_file(&tmp); return CaptureResult { articles: vec![], note: format!("打开历史库失败：{e}") } }
-    };
     let mut map: std::collections::HashMap<String, WxArticle> = std::collections::HashMap::new();
-    if let Ok(mut stmt) = conn.prepare("select url, title, visit_count, last_visit_time from urls order by last_visit_time desc limit 800") {
-        let _ = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0).unwrap_or_default(),
-                row.get::<_, String>(1).unwrap_or_default(),
-                row.get::<_, i64>(2).unwrap_or(0),
-                row.get::<_, i64>(3).unwrap_or(0),
-            ))
-        }).map(|rows| {
-            for r in rows.flatten() {
-                if !is_useful(&r.0) || !is_mp_article(&r.0) { continue; }
-                let time = chromium_to_local(r.3);
-                if !in_days(&time, days) { continue; }
-                let k = key_of(&r.0);
-                map.entry(k).or_insert(WxArticle {
-                    url: r.0.clone(), title: if r.1.is_empty() { "(无标题)".into() } else { r.1 }, author: String::new(), time, visits: r.2.max(0) as u32,
-                });
-            }
-        });
-    }
-    let _ = conn.close();
-    let _ = fs::remove_file(&tmp);
+    let mut hist_n = 0usize;      // 浏览库（History）条数
+    let mut share_n = 0usize;     // 分享库（Share Data）条数
+    let mut encrypted = 0usize;   // 被微信加密的库个数
+    let mut locked = 0usize;      // 复制失败的库个数
 
-    // Share Data：补公众号作者
-    if let Some(sd) = newest_file(root, "Share Data") {
-        if let Ok(tmp2) = copy_db(&sd) {
-            if let Ok(c2) = rusqlite::Connection::open(&tmp2) {
-                if let Ok(mut st) = c2.prepare("select url, real_url, author, share_data from share_data_table limit 1000") {
-                    let _ = st.query_map([], |row| {
-                        Ok((
-                            row.get::<_, String>(0).unwrap_or_default(),
-                            row.get::<_, String>(1).unwrap_or_default(),
-                            row.get::<_, String>(2).unwrap_or_default(),
-                            row.get::<_, String>(3).unwrap_or_default(),
-                        ))
-                    }).map(|rows| {
-                        for r in rows.flatten() {
-                            let (u, real, author, sd_text) = r;
-                            // share_data JSON 里可能有 nick_name
-                            let author = if author.is_empty() {
-                                serde_json::from_str::<serde_json::Value>(&sd_text).ok()
-                                    .and_then(|j| j["nick_name"].as_str().map(String::from)).unwrap_or_default()
-                            } else { author };
-                            for cand in [&real, &u] {
-                                if !is_useful(cand) { continue; }
-                                let k = key_of(cand);
-                                if let Some(a) = map.get_mut(&k) {
-                                    if a.author.is_empty() { a.author = author.clone(); }
-                                }
-                            }
-                        }
-                    });
+    // ---- 来源 1：History（微信 4.0 明文可用；4.1+ 多为整库密文，文件头不是 SQLite）----
+    for hist in all_files(root, "History") {
+        if !is_sqlite(&hist) { encrypted += 1; continue; }
+        let tmp = match copy_db(&hist) { Ok(t) => t, Err(_) => { locked += 1; continue; } };
+        if let Ok(conn) = rusqlite::Connection::open(&tmp) {
+            if let Ok(mut stmt) = conn.prepare("select url, title, visit_count, last_visit_time from urls order by last_visit_time desc limit 2000") {
+                let rows: Vec<(String, String, i64, i64)> = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0).unwrap_or_default(),
+                        row.get::<_, String>(1).unwrap_or_default(),
+                        row.get::<_, i64>(2).unwrap_or(0),
+                        row.get::<_, i64>(3).unwrap_or(0),
+                    ))
+                }).map(|it| it.filter_map(|r| r.ok()).collect()).unwrap_or_default();
+                for (url, title, vc, lvt) in rows {
+                    if !is_useful(&url) || !is_mp_article(&url) { continue; }
+                    hist_n += 1;
+                    upsert(&mut map, url, title, String::new(), chromium_to_local(lvt), vc.max(0) as u32);
                 }
             }
-            let _ = fs::remove_file(&tmp2);
         }
+        let _ = fs::remove_file(&tmp);
     }
-    let mut arts: Vec<WxArticle> = map.into_values().collect();
+
+    // ---- 来源 2：Share Data（明文 SQLite；微信 4.1+ 反而只剩这里能读）----
+    for sd in all_files(root, "Share Data") {
+        if !is_sqlite(&sd) { encrypted += 1; continue; }
+        let tmp = match copy_db(&sd) { Ok(t) => t, Err(_) => { locked += 1; continue; } };
+        if let Ok(conn) = rusqlite::Connection::open(&tmp) {
+            // share_data 字段是 BLOB，cast 成 text 才好取；用 rowid 兼容不同版本的 id 列
+            if let Ok(mut st) = conn.prepare("select rowid, url, real_url, author, cast(share_data as text) from share_data_table") {
+                let rows: Vec<(i64, String, String, String, String)> = st.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0).unwrap_or(0),
+                        row.get::<_, String>(1).unwrap_or_default(),
+                        row.get::<_, String>(2).unwrap_or_default(),
+                        row.get::<_, String>(3).unwrap_or_default(),
+                        row.get::<_, String>(4).unwrap_or_default(),
+                    ))
+                }).map(|it| it.filter_map(|r| r.ok()).collect()).unwrap_or_default();
+                // 表里没有时间列：拿带 clicktime 的行做 id↔时间锚点，其余插值
+                let mut anchors: Vec<(i64, i64)> = rows.iter()
+                    .filter_map(|(id, u, real, _, _)| clicktime_of(real).or_else(|| clicktime_of(u)).map(|t| (*id, t)))
+                    .collect();
+                anchors.sort_by_key(|x| x.0);
+                for (id, u, real, author, sd_text) in rows {
+                    let url = if is_useful(&real) { real } else { u };
+                    if !is_useful(&url) || !is_mp_article(&url) { continue; }
+                    let author = if author.is_empty() {
+                        serde_json::from_str::<serde_json::Value>(&sd_text).ok().and_then(|j| {
+                            j["brandName"].as_str().or_else(|| j["nick_name"].as_str()).map(String::from)
+                        }).unwrap_or_default()
+                    } else { author };
+                    let time = clicktime_of(&url)
+                        .or_else(|| est_time(&anchors, id))
+                        .map(unix_to_local)
+                        .unwrap_or_default();
+                    share_n += 1;
+                    upsert(&mut map, url, String::new(), author, time, 1);
+                }
+            }
+        }
+        let _ = fs::remove_file(&tmp);
+    }
+
+    let mut arts: Vec<WxArticle> = map.into_values()
+        .filter(|a| a.time.is_empty() || in_days(&a.time, days))
+        .collect();
     arts.sort_by(|a, b| b.time.cmp(&a.time));
-    let note = format!("共 {} 篇公众号文章（最近 {} 天）", arts.len(), days);
+    // 时间推算不出来的放最后，最多留 200 条，别把列表灌爆
+    let (mut timed, mut untimed): (Vec<WxArticle>, Vec<WxArticle>) = arts.into_iter().partition(|a| !a.time.is_empty());
+    untimed.truncate(200);
+    timed.extend(untimed);
+    arts = timed;
+
+    let mut note = format!("共 {} 篇公众号文章（最近 {} 天）", arts.len(), days);
+    let mut src = Vec::new();
+    if share_n > 0 { src.push(format!("分享库 {share_n} 条")); }
+    if hist_n > 0 { src.push(format!("浏览库 {hist_n} 条")); }
+    if !src.is_empty() { note.push_str(&format!("｜{}", src.join("、"))); }
+    if encrypted > 0 { note.push_str(&format!("；{} 个记录库被微信加密，已跳过", encrypted)); }
+    if locked > 0 { note.push_str(&format!("；{} 个库被占用未读", locked)); }
     CaptureResult { articles: arts, note }
 }
 
@@ -286,10 +368,18 @@ pub async fn wx_make_cards(state: tauri::State<'_, crate::PetState>, articles: V
     let mut done = Vec::new();
     for a in &articles {
         if known.contains(&key_of(&a.url)) { continue; }
-        let prompt = format!(
+        let author = if a.author.is_empty() { "未知".to_string() } else { a.author.clone() };
+        let prompt = if cfg.prompt_wechat.trim().is_empty() {
+            format!(
             "你是知识库管理员。下面是一篇微信公众号文章的标题和链接（没有正文）。基于标题推测主题，写一张「待补全」知识卡。\n输出 frontmatter + 正文，格式严格如下（YAML）:\n---\ntitle: 卡片标题（10字内）\ntags: [微信, 公众号, 待补全]\nstatus: seed\nsource: \"微信: {}\"\nurl: \"{}\"\n---\n\n# 标题说了什么\n\n（从标题推断的核心主题，50字内，注明「基于标题推测，待读原文补全」）\n\n## 下一步行动\n\n- [ ] 打开原文阅读并补全此卡\n\n文章标题：{}\n公众号：{}",
-            a.url, a.url, a.title, if a.author.is_empty() { "未知" } else { &a.author }
-        );
+            a.url, a.url, a.title, &author
+        )
+        } else {
+            cfg.prompt_wechat
+                .replace("{title}", &a.title)
+                .replace("{author}", &author)
+                .replace("{url}", &a.url)
+        };
         let content = crate::ai_chat(&cfg, &prompt).await?;
         let body = match content.find("\n---\n").or_else(|| content.starts_with("---").then(|| 0)) {
             Some(p) => &content[p.max(0)..],
