@@ -304,6 +304,16 @@ async function testConfig() {
   refresh();
 }
 
+// ---- 贴文本抠链接 ----
+const pasteBox = ref(false);
+const pasteText = ref("");
+const pasteMsg = ref("");
+async function capturePaste() {
+  pasteMsg.value = "抠取中…";
+  try { pasteMsg.value = "✅ " + await invoke<string>("capture_text_urls", { text: pasteText.value }); pasteText.value = ""; refresh(); }
+  catch (e) { pasteMsg.value = "❌ " + String(e).slice(0, 120); }
+}
+
 // ---- 设置页标签 ----
 const setTab = ref<"general" | "ai" | "notion" | "feishu">("ai");
 interface ModelEntry { id: string; kind: string }
@@ -693,6 +703,14 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <span>❌ {{ st["fetch-failed"] }}</span>
       <span>🗂 知识卡 {{ st.notes }}</span>
       <button class="mini" :disabled="!st.queue" @click="crawlAll">🕷 抓取队列({{ st.queue }})</button>
+      <button class="mini" @click="pasteBox = !pasteBox">📋 贴文本抠链接</button>
+    </div>
+    <div v-if="pasteBox" style="margin:0 16px 8px">
+      <textarea v-model="pasteText" rows="3" placeholder="把含链接的一段话/聊天记录/笔记粘进来，自动抠出所有 URL 去重入队" style="width:100%;font-size:12px"></textarea>
+      <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+        <button class="mini ok" :disabled="!pasteText.trim()" @click="capturePaste">🔍 抠出链接入队</button>
+        <span v-if="pasteMsg" class="mut" style="font-size:12px">{{ pasteMsg }}</span>
+      </div>
     </div>
 
     <div class="filters">

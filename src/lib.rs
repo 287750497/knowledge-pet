@@ -227,11 +227,18 @@ fn scan_items(kb: &PathBuf) -> Vec<Item> {
     let inbox = kb.join("10-inbox");
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(&inbox) {
-        let mut files: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |x| x == "md")).collect();
+        let entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        let mut files: Vec<_> = entries.iter().map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "md"))
+            .chain(entries.iter().filter(|e| e.path().is_dir())
+                .filter_map(|d| fs::read_dir(d.path()).ok()
+                    .and_then(|rd2| rd2.filter_map(|e| e.ok())
+                        .find(|e| e.file_name() == "index.md").map(|e| e.path()))))
+            .collect();
         files.sort();
         for p in files {
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            let rel = p.strip_prefix(&inbox).unwrap_or(&p).to_string_lossy().to_string();
+            let name = rel.trim_end_matches(".md").to_string();
             let text = fs::read_to_string(&p).unwrap_or_default();
             let status = fm_field(&text, "status").unwrap_or_else(|| "seed".into());
             let kind = fm_field(&text, "kind").unwrap_or_else(|| "text".into());
@@ -239,10 +246,10 @@ fn scan_items(kb: &PathBuf) -> Vec<Item> {
             let title = text.lines()
                 .find(|l| l.starts_with("# ") && !l.starts_with("#!"))
                 .map(|l| l[2..].trim().to_string())
-                .unwrap_or_else(|| name.trim_end_matches(".md").to_string());
+                .unwrap_or_else(|| p.file_name().unwrap().to_string_lossy().trim_end_matches(".md").to_string());
             out.push(Item {
-                id: name.trim_end_matches(".md").to_string(),
-                file: format!("10-inbox/{}", name),
+                id: name.clone(),
+                file: format!("10-inbox/{}", rel),
                 title, kind, url, status,
                 created_at: name.chars().take(12).collect(),
                 error: String::new(),
@@ -316,13 +323,52 @@ async fn process_queue(state: State<'_, PetState>) -> Result<String, String> {
     eprintln!("[pet] html len={}", html.len());
     let (title, content) = extract_article(&html);
     eprintln!("[pet] extracted title={:?} content_len={} writing...", title, content.len());
+    // 每篇文章单独文件夹：10-inbox/<日期-标题>/index.md + images/（各就各位，借鉴数海丹心下载工具）
+    let folder_name = sanitize(&format!("{}-{}", chrono_today(), title.chars().take(40).collect::<String>()));
+    let dir = kb.join("10-inbox").join(&folder_name);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // 下载文中图片（还原懒加载 data-src），失败不阻塞
+    let img_dir = dir.join("images");
+    let mut saved_imgs = 0;
+    let lower = html.to_lowercase();
+    let mut img_urls: Vec<String> = Vec::new();
+    for attr in ["data-src", "src"] {
+        let mut from = 0;
+        while let Some(p) = lower[from..].find(&format!("{}=\"{}", attr, "http")) {
+            let start = from + p + attr.len() + 2;
+            let end = html[start..].find('"').map(|x| start + x).unwrap_or(start);
+            let u = html[start..end.min(html.len())].to_string();
+            if (u.starts_with("http://") || u.starts_with("https://")) && !img_urls.contains(&u) {
+                let tail = u.rsplit('.').next().unwrap_or("png").to_lowercase();
+                if ["png","jpg","jpeg","gif","webp"].contains(&tail.as_str()) { img_urls.push(u); }
+            }
+            from = end.max(from + 1);
+            if img_urls.len() >= 30 { break; }
+        }
+    }
+    let cli = reqwest::Client::new();
+    let mut idx = 1;
+    for u in &img_urls {
+        if let Ok(bytes) = cli.get(u).send().await {
+            if let Ok(b) = bytes.bytes().await {
+                if b.len() > 1024 {
+                    let ext = u.rsplit('.').next().unwrap_or("png").split('?').next().unwrap_or("png");
+                    let _ = fs::create_dir_all(&img_dir);
+                    if fs::write(img_dir.join(format!("img-{:02}.{}", idx, ext)), &b).is_ok() { saved_imgs += 1; idx += 1; }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
     let new_text = format!(
-        "---\nkind: url\nurl: {}\nstatus: fetched\ncreated: {}\n---\n\n# {}\n\n> 来源：{}\n\n{}",
-        url, chrono_today(), title, url, content
+        "---\nkind: url\nurl: {}\nstatus: fetched\ncreated: {}\n---\n\n# {}\n\n> 来源：{}\n> 附件：images/ 共 {} 张\n\n{}",
+        url, chrono_today(), title, url, saved_imgs, content
     );
-    fs::write(&path, &new_text).map_err(|e| { eprintln!("[pet] write err: {}", e); e.to_string() })?;
-    eprintln!("[pet] write ok {} bytes", new_text.len());
-    Ok(format!("已抓取：{}", title))
+    fs::write(dir.join("index.md"), &new_text).map_err(|e| { eprintln!("[pet] write err: {}", e); e.to_string() })?;
+    // 删掉旧的 seed 占位文件（scan_items 会把文件夹下的 index.md 当新条目）
+    let _ = fs::remove_file(&path);
+    eprintln!("[pet] write ok {} bytes, {} imgs", new_text.len(), saved_imgs);
+    Ok(format!("已抓取：{}（附 {} 张图）", title, saved_imgs))
 }
 
 // 极简正文提取
@@ -603,7 +649,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(PetState { kb_dir: Mutex::new(kb), config: Mutex::new(cfg), queue: Mutex::new(Vec::new()) })
         .invoke_handler(tauri::generate_handler![
-            list_items, capture, process_queue, ai_make_card, mark_read, delete_item, fetch_models,
+            list_items, capture, process_queue, capture_text_urls, ai_make_card, mark_read, delete_item, fetch_models,
             get_config, set_config, move_kb_dir, list_bookmarks, add_bookmark, remove_bookmark,
             stats, bubble, open_kb, read_clipboard_text,
             list_cards, quote_create, list_drafts, gen_topics, daily_review,
@@ -928,6 +974,49 @@ fn daily_review(state: State<PetState>) -> Result<serde_json::Value, String> {
 
 
 #[cfg(test)]
+mod v095_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_scan_items_finds_subfolder_index() {
+        let dir = std::env::temp_dir().join(format!("pet-v095-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("10-inbox")).unwrap();
+        fs::write(dir.join("10-inbox/old.md"), "---\nstatus: seed\nkind: text\n---\n\n# 旧条目\n内容").unwrap();
+        fs::create_dir_all(dir.join("10-inbox/2026-11-07-测试文章/images")).unwrap();
+        fs::write(dir.join("10-inbox/2026-11-07-测试文章/index.md"),
+            "---\nkind: url\nurl: https://x\nstatus: fetched\ncreated: 2026-11-07\n---\n\n# 测试文章标题\n\n正文").unwrap();
+        let items = scan_items(&dir);
+        assert_eq!(items.len(), 2, "应同时找到顶层 md 与子文件夹 index.md");
+        let sub = items.iter().find(|i| i.file.contains("index.md")).expect("子文件夹条目");
+        assert_eq!(sub.title, "测试文章标题");
+        assert_eq!(sub.status, "fetched");
+        assert!(sub.file.starts_with("10-inbox/2026-11-07-测试文章/index.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_url_extract_from_pasted_text() {
+        // 与 capture_text_urls 相同的分隔逻辑（复制保持一致）
+        let text = "看看这两篇 https://mp.weixin.qq.com/s/abc123 和 http://example.com/a?x=1)还有这个<br>https://mp.weixin.qq.com/s/abc123 重复";
+        let mut urls = Vec::new();
+        for word in text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == '>') {
+            let w = word.trim_start_matches('(').trim_start_matches('<');
+            let url = if w.starts_with("http://") || w.starts_with("https://") {
+                w.split(|c| c == '<' || c == '>').next().unwrap_or(w).to_string()
+            } else { continue };
+            let url = url.trim_end_matches(&[')', '>', ',', '，', '。', '；', ';'][..]).to_string();
+            if url.len() < 12 || urls.contains(&url) { continue; }
+            urls.push(url);
+        }
+        assert_eq!(urls.len(), 2, "应抠出 2 个去重后的 URL");
+        assert_eq!(urls[0], "https://mp.weixin.qq.com/s/abc123");
+        assert_eq!(urls[1], "http://example.com/a?x=1");
+    }
+}
+
+#[cfg(test)]
 mod workshop_tests {
     use super::*;
     use std::fs;
@@ -1013,4 +1102,33 @@ mod workshop_tests {
         assert!(todos[0].starts_with("待办"), "todos={:?} card={}", todos, card.title);
         fs::remove_dir_all(&dir).ok();
     }
+}/// 从粘贴文本中抠出所有 URL，去重后批量入队（借鉴数海丹心下载工具）
+#[tauri::command]
+fn capture_text_urls(state: State<PetState>, text: String) -> Result<String, String> {
+    let kb = state.kb_dir.lock().unwrap().clone();
+    let mut added = 0; let mut skipped = 0;
+    let existing: Vec<String> = scan_items(&kb).iter().map(|i| i.url.clone()).collect();
+    let mut seen: Vec<String> = Vec::new();
+    for word in text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == '>') {
+        let w = word.trim_start_matches('(').trim_start_matches('<');
+        let url = if w.starts_with("http://") || w.starts_with("https://") {
+            w.split(|c| c == '<' || c == '>').next().unwrap_or(w).to_string()
+        } else { continue };
+        let url = url.trim_end_matches(&[')', '>', ',', '，', '。', '；', ';'][..]).to_string();
+        if url.len() < 12 || seen.contains(&url) { continue; }
+        seen.push(url.clone());
+        if existing.contains(&url) { skipped += 1; continue; }
+        let id = now_id();
+        let fname = format!("{}-网页剪藏.md", id);
+        let body = format!("---\nkind: url\nurl: {}\nstatus: seed\ncreated: {}\n---\n\n# 网页剪藏\n\n{}", url, chrono_today(), url);
+        let full = kb.join("10-inbox").join(&fname);
+        fs::create_dir_all(full.parent().unwrap()).map_err(|e| e.to_string())?;
+        fs::write(&full, body).map_err(|e| e.to_string())?;
+        state.queue.lock().unwrap().push(id.clone());
+        added += 1;
+    }
+    if added == 0 && skipped == 0 { return Err("文本里没找到链接".into()); }
+    Ok(format!("已加入 {} 条链接{}（重复跳过 {}）", added, if skipped > 0 { "，已收过的不再收" } else { "" }, skipped))
 }
+
+
