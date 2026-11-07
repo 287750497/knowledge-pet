@@ -242,24 +242,38 @@ pub(crate) fn capture_sync(root: &Path, days: u32) -> CaptureResult {
         let tmp = match copy_db(&sd) { Ok(t) => t, Err(_) => { locked += 1; continue; } };
         if let Ok(conn) = rusqlite::Connection::open(&tmp) {
             // share_data 字段是 BLOB，cast 成 text 才好取；用 rowid 兼容不同版本的 id 列
-            if let Ok(mut st) = conn.prepare("select rowid, url, real_url, author, cast(share_data as text) from share_data_table") {
-                let rows: Vec<(i64, String, String, String, String)> = st.query_map([], |row| {
+            // 带 title 列的版本优先（新版 share_data_table 有 title）；旧库无此列则退回
+            let sql = "select rowid, url, real_url, author, cast(share_data as text), ifnull(title,'') from share_data_table";
+            let sql_fallback = "select rowid, url, real_url, author, cast(share_data as text), '' from share_data_table";
+            let mut rows: Vec<(i64, String, String, String, String, String)> = Vec::new();
+            let mut st = conn.prepare(sql).or_else(|_| conn.prepare(sql_fallback)).ok();
+            if let Some(st) = st.as_mut() {
+                rows = st.query_map([], |row| {
                     Ok((
                         row.get::<_, i64>(0).unwrap_or(0),
                         row.get::<_, String>(1).unwrap_or_default(),
                         row.get::<_, String>(2).unwrap_or_default(),
                         row.get::<_, String>(3).unwrap_or_default(),
                         row.get::<_, String>(4).unwrap_or_default(),
+                        row.get::<_, String>(5).unwrap_or_default(),
                     ))
                 }).map(|it| it.filter_map(|r| r.ok()).collect()).unwrap_or_default();
+            }
                 // 表里没有时间列：拿带 clicktime 的行做 id↔时间锚点，其余插值
                 let mut anchors: Vec<(i64, i64)> = rows.iter()
-                    .filter_map(|(id, u, real, _, _)| clicktime_of(real).or_else(|| clicktime_of(u)).map(|t| (*id, t)))
+                    .filter_map(|(id, u, real, _, _, _)| clicktime_of(real).or_else(|| clicktime_of(u)).map(|t| (*id, t)))
                     .collect();
                 anchors.sort_by_key(|x| x.0);
-                for (id, u, real, author, sd_text) in rows {
+                for (id, u, real, author, sd_text, sd_title) in rows {
                     let url = if is_useful(&real) { real } else { u };
                     if !is_useful(&url) || !is_mp_article(&url) { continue; }
+                    // title 优先取表列，其次 share_data JSON 里的 title/subject
+                    let mut title = sd_title;
+                    if title.is_empty() {
+                        if let Some(j) = serde_json::from_str::<serde_json::Value>(&sd_text).ok() {
+                            title = j["title"].as_str().or_else(|| j["subject"].as_str()).map(String::from).unwrap_or_default();
+                        }
+                    }
                     let author = if author.is_empty() {
                         serde_json::from_str::<serde_json::Value>(&sd_text).ok().and_then(|j| {
                             j["brandName"].as_str().or_else(|| j["nick_name"].as_str()).map(String::from)
@@ -270,10 +284,10 @@ pub(crate) fn capture_sync(root: &Path, days: u32) -> CaptureResult {
                         .map(unix_to_local)
                         .unwrap_or_default();
                     share_n += 1;
-                    upsert(&mut map, url, String::new(), author, time, 1);
+                    upsert(&mut map, url, title, author, time, 1);
                 }
             }
-        }
+
         let _ = fs::remove_file(&tmp);
     }
 

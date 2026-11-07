@@ -844,7 +844,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <p v-if="wxMsg" class="wxmsg" :class="wxMsg.startsWith('❌') ? 'err' : wxMsg.startsWith('✅') ? 'ok' : 'busy'">{{ wxMsg }}</p>
       <div v-for="a in wxArts" :key="a.url" class="mut" style="margin:4px 0;font-size:12px;display:flex;align-items:center;gap:6px">
         <input type="checkbox" :checked="wxPicked.has(a.url)" @change="toggleWx(a.url)" style="margin:0" />
-        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="a.title">📰 {{ a.title }}</span>
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left" :title="a.url">📰 {{ a.title !== '(无标题)' ? a.title : a.url.replace(/^https?:\/\//,'').slice(0,60) }}</span>
         <span class="mut" style="white-space:nowrap">{{ a.author || '未知号' }} · {{ a.time }}</span>
       </div>
       <p v-if="!wxArts.length" class="mut" style="font-size:12px">点「抓取浏览记录」读取你在微信里看过的公众号文章（只读本地记录，需 Windows + 微信 4.x）</p>
