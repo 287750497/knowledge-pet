@@ -698,7 +698,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
     </div>
 
     <div v-if="drafts.length" class="cardblock">
-      <h3 class="bmtitle" style="margin-top:0">📄 草稿（50-drafts/）</h3>
+      <h3 class="bmtitle">📄 草稿（50-drafts/）</h3>
       <div v-for="d in drafts" :key="d.file" class="mut" style="margin:4px 0;font-size:12px">
         📄 {{ d.title }} <span class="mut">· {{ d.created }} · 用卡：{{ d.tags }}</span>
         <button class="mini" style="margin-left:8px" @click="pushDraftToNotion(d.file)">📖 推到 Notion</button>
@@ -706,7 +706,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
     </div>
 
     <div class="cardblock">
-      <h3 class="bmtitle" style="margin-top:0">📥 微信文章采集（最近 7 天浏览）</h3>
+      <h3 class="bmtitle">📥 微信文章采集（最近 7 天浏览）</h3>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
         <button class="mini" :disabled="!!wxBusy" @click="wxScan">{{ wxBusy === 'scan' ? "读取中…" : "🔍 抓取浏览记录" }}</button>
         <button class="mini ok" :disabled="!!wxBusy || !wxPicked.size" @click="wxSave">📥 存收件箱 ({{ wxPicked.size }})</button>
@@ -723,7 +723,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
     </div>
 
     <div class="cardblock">
-      <h3 class="bmtitle" style="margin-top:0">👀 公众号实时监听</h3>
+      <h3 class="bmtitle">👀 公众号实时监听</h3>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
         <input v-model="watchNewName" placeholder="公众号名" style="width:110px;font-size:12px" />
         <input v-model="watchNewBiz" placeholder="biz（__biz= 参数）" style="width:170px;font-size:12px" @keyup.enter="watchAdd" />
@@ -904,62 +904,122 @@ body { font-family: system-ui, "Microsoft YaHei"; overflow: hidden; }
 }
 .pet-hint { margin-top: 6px; font-size: 11px; color: #5a4632; background: rgba(255,250,242,.88); border: 1px solid rgba(90,60,30,.08); border-radius: 999px; padding: 2px 10px; box-shadow: 0 2px 6px rgba(60,40,20,.12); }
 
-/* 面板 */
-.panel { width: 100vw; height: 100vh; background: #f7f5f1; color: #1a1a1a; padding: 16px; overflow-y: auto; }
-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-h2 { font-size: 18px; flex: 1; }
-.statrow { display: flex; gap: 14px; align-items: center; font-size: 13px; color: #666; margin-bottom: 10px; flex-wrap: wrap; }
-.filters { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
-.filters button { border: 1px solid #ddd; background: #fff; border-radius: 999px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
-.filters button.active { background: #f97316; color: #fff; border-color: #f97316; }
-.card { background: #fff; border: 1px solid #e5e0d8; border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
-.row1 { display: flex; align-items: center; gap: 8px; }
-.title { flex: 1; font-size: 14px; }
-.st { font-size: 12px; color: #888; }
-.badge { font-size: 14px; }
-.url { display: block; font-size: 12px; color: #2563eb; margin: 6px 0; word-break: break-all; }
-.btns { display: flex; gap: 8px; margin-top: 8px; }
-.mini { border: 0; background: #eee; color: #444; border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; }
-.mini.ok { background: #f97316; color: #fff; }
+/* ============ 管理面板 · 设计规范（微信绿 + 白卡片 + 灰阶，对齐 WeChatPubMonitor 复刻版） ============
+   色板：BG #F3F4F8 / CARD #FFF / 边框 #E2E8F0 / 主色 #07C160 (#06AD56 hover, #E6F9EF light)
+   文字：#0F172A / #334155 / #64748B / #94A3B8   警告 #D97706   危险 #B91C1C */
+.panel {
+  width: 100vw; height: 100vh; overflow-y: auto;
+  background: #F3F4F8; color: #0F172A;
+  font-family: system-ui, "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  padding: 0 0 24px;
+}
+/* 顶栏：白底页头 + 工具栏 */
+.panel > header {
+  display: flex; align-items: center; gap: 12px;
+  background: #FFFFFF; border-bottom: 1px solid #E2E8F0;
+  padding: 12px 20px; margin-bottom: 14px;
+  position: sticky; top: 0; z-index: 10;
+}
+.panel > header h2 { font-size: 16px; font-weight: 600; color: #0F172A; flex: 1; display: flex; align-items: center; gap: 8px; }
+.panel > header h2::before { content: ""; width: 4px; height: 18px; border-radius: 2px; background: #07C160; }
+/* 通用按钮（工具栏/卡片内） */
+.panel button, .settabs button, .filters button {
+  border: 1px solid #E2E8F0; background: #FFFFFF; color: #334155;
+  border-radius: 8px; padding: 6px 14px; font-size: 12.5px; cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.panel button:hover { background: #F9FAFB; border-color: #CBD5E1; }
+.panel button:active { transform: translateY(1px); }
+.panel button:disabled { opacity: .45; cursor: default; }
+/* 主操作按钮（绿色实心） */
+.mini.ok { background: #07C160; border-color: #07C160; color: #fff; }
+.mini.ok:hover { background: #06AD56; border-color: #06AD56; }
+.mini.ok:disabled { opacity: .5; }
+.mini { border: 1px solid #E2E8F0; background: #FFFFFF; color: #334155; border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; transition: background .12s, border-color .12s; }
+.mini:hover { background: #F9FAFB; border-color: #CBD5E1; }
 .mini:disabled { opacity: .4; cursor: default; }
-.empty { text-align: center; color: #999; padding: 40px 0; font-size: 13px; }
-
-/* 删除按钮 */
-.mini.danger { background: #fee2e2; color: #b91c1c; }
+.mini.danger { background: #FDD5D5; border-color: #FECACE; color: #B91C1C; }
+.mini.danger:hover { background: #FECACE; }
+/* 返回/设置等 header 小按钮 */
+.panel > header .mini { padding: 6px 14px; }
+/* 状态统计行 → 浅灰数据条 */
+.statrow {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin: 0 20px 10px; padding: 10px 14px;
+  background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px;
+  font-size: 12.5px; color: #64748B;
+}
+.statrow span { padding: 2px 8px; background: #F9FAFB; border-radius: 6px; }
+.statrow .mini { margin-left: auto; }
+/* 筛选 tabs */
+.filters { display: flex; gap: 6px; margin: 0 20px 12px; flex-wrap: wrap; }
+.filters button { border-radius: 999px; padding: 5px 14px; }
+.filters button.active { background: #07C160; border-color: #07C160; color: #fff; }
+/* 内容卡 */
+.card {
+  background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px;
+  padding: 12px 14px; margin: 0 20px 10px;
+}
+.row1 { display: flex; align-items: center; gap: 8px; }
+.title { flex: 1; font-size: 13.5px; color: #0F172A; font-weight: 500; }
+.st { font-size: 12px; color: #94A3B8; }
+.badge { font-size: 14px; }
+.url { display: block; font-size: 12px; color: #07C160; margin: 6px 0; word-break: break-all; text-decoration: none; }
+.url:hover { text-decoration: underline; }
+.btns { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.empty { text-align: center; color: #94A3B8; padding: 40px 0; font-size: 13px; }
+/* 分节标题：左绿条 + 灰说明 */
+.bmtitle { font-size: 14px; font-weight: 600; color: #0F172A; margin: 20px 20px 8px; display: flex; align-items: center; gap: 8px; }
+.bmtitle::before { content: ""; width: 4px; height: 14px; border-radius: 2px; background: #07C160; flex: none; }
+/* 工坊/采集/监听分块卡片 */
+.cardblock { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; padding: 12px 14px; margin: 0 20px 10px; }
+.cardblock .bmtitle, .cardblock h3.bmtitle { margin: 0 0 10px; }
+/* 输入框 */
+.panel input, .bmform input, .cfgform input {
+  padding: 8px 12px; border: 1px solid #E2E8F0; border-radius: 8px;
+  font-size: 13px; color: #0F172A; background: #FFFFFF; outline: none;
+  transition: border-color .12s, box-shadow .12s;
+}
+.panel input:focus, .bmform input:focus, .cfgform input:focus {
+  border-color: #07C160; box-shadow: 0 0 0 3px rgba(7,193,96,.12);
+}
+.panel input::placeholder { color: #94A3B8; }
 /* 常用网址 */
-.bmtitle { font-size: 15px; margin: 18px 0 8px; }
-.bmform { display: flex; gap: 6px; margin-bottom: 10px; }
+.bmform { display: flex; gap: 6px; margin: 0 20px 10px; }
 .bmform .bm-title { width: 160px; }
 .bmform .bm-url { flex: 1; }
-.bmform input { padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; }
-.bmgrid { display: flex; flex-wrap: wrap; gap: 8px; }
-.bmitem { display: flex; align-items: center; gap: 6px; background: #fff; border: 1px solid #e5e0d8; border-radius: 999px; padding: 6px 12px; }
-.bmlink { font-size: 13px; color: #2563eb; text-decoration: none; }
+.bmgrid { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 20px; }
+.bmitem { display: flex; align-items: center; gap: 6px; background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 999px; padding: 6px 12px; }
+.bmitem:hover { border-color: #CBD5E1; }
+.bmlink { font-size: 13px; color: #07C160; text-decoration: none; }
 .bmlink:hover { text-decoration: underline; }
 .bmitem .mini.danger { padding: 2px 8px; border-radius: 999px; }
-.empty2 { font-size: 12px; color: #999; }
-/* 设置分节 */
-.sect { font-size: 15px; margin: 18px 0 4px; border-top: 1px dashed #e5e0d8; padding-top: 14px; }
+.empty2 { font-size: 12px; color: #94A3B8; margin: 0 20px; }
+/* 设置页 */
+.sect { font-size: 14px; font-weight: 600; color: #0F172A; margin: 18px 0 4px; border-top: 1px solid #E2E8F0; padding-top: 14px; }
 form > .sect:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
-
-/* 设置 */
-.settabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
-.settabs button { border: 1px solid #ddd; background: #fff; border-radius: 999px; padding: 6px 14px; cursor: pointer; font-size: 13px; color: #444; }
-.settabs button.active { background: #f97316; color: #fff; border-color: #f97316; }
-.chkline { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #444; margin-top: 12px; cursor: pointer; }
-.notionpreview { list-style: none; padding: 0; margin: 10px 0; font-size: 12px; color: #555; background: #fff; border: 1px solid #e5e0d8; border-radius: 8px; }
-.notionpreview li { padding: 6px 10px; border-bottom: 1px solid #f0ece4; }
+.panel.settings { padding: 0 0 24px; }
+.panel.settings > header { position: sticky; }
+.settabs { display: flex; gap: 6px; margin: 0 20px 14px; flex-wrap: wrap; }
+.settabs button { border-radius: 999px; padding: 6px 16px; }
+.settabs button.active { background: #07C160; border-color: #07C160; color: #fff; }
+.chkline { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #334155; margin-top: 12px; cursor: pointer; }
+.notionpreview { list-style: none; padding: 0; margin: 10px 0; font-size: 12px; color: #64748B; background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; }
+.notionpreview li { padding: 6px 10px; border-bottom: 1px solid #F3F4F8; }
 .notionpreview li:last-child { border-bottom: 0; }
-.tip.err { color: #b91c1c; }
-.cfgform { max-width: 480px; display: flex; flex-direction: column; }
-.cfgform label { font-size: 13px; color: #555; margin: 10px 0 4px; }
-.cfgform input { padding: 9px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; }
-.tip { font-size: 12px; color: #999; margin: 12px 0; }
-</style>
-
+.tip { font-size: 12px; color: #94A3B8; margin: 12px 0; }
+.tip.err { color: #B91C1C; }
+.cfgform { max-width: 480px; display: flex; flex-direction: column; margin: 0 20px; }
+.cfgform label { font-size: 12.5px; color: #64748B; margin: 10px 0 4px; }
 /* 知识卡工坊 */
-.cardblock { border: 1px solid var(--line, #e5e7eb); border-radius: 10px; padding: 10px; margin: 8px 0; }
-.cardrow { display: flex; gap: 8px; align-items: center; padding: 6px; border-radius: 8px; cursor: pointer; }
-.cardrow:hover { background: rgba(99,102,241,.08); }
-.cardrow.picked { background: rgba(99,102,241,.15); }
-.mut { color: #6b7280; }
+.cardrow { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border-radius: 8px; cursor: pointer; transition: background .1s; }
+.cardrow:hover { background: #F3F4F8; }
+.cardrow.picked { background: #E6F9EF; }
+.mut { color: #64748B; }
+/* 进度条换绿 */
+.progwrap { height: 6px; background: #E2E8F0; border-radius: 999px; margin: 10px 0 4px; overflow: hidden; }
+.progbar { height: 100%; background: #07C160; border-radius: 999px; transition: width .3s; }
+/* 表单主按钮（保存） */
+form .ok, .cfgform .ok { background: #07C160; border-color: #07C160; color: #fff; }
+form .ok:hover, .cfgform .ok:hover { background: #06AD56; }
+</style>
