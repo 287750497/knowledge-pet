@@ -6,6 +6,7 @@ import PetSprite from "./components/PetSprite.vue";
 
 interface Item { id: string; file: string; title: string; kind: string; url: string; status: string; created_at: string; error: string }
 interface AiConfig { base_url: string; api_key: string; model: string; hotkey: string; kb_dir_override: string;
+  prompt_article?: string; prompt_wechat?: string; prompt_quote?: string; prompt_topics?: string; prompt_daily?: string;
   feishu_webhook: string; feishu_push_daily: boolean; notion_token: string; notion_db_id: string }
 interface Bookmark { title: string; url: string }
 interface Stats { total: number; seed: number; fetched: number; "fetch-failed": number; read: number; carded: number; queue: number; notes: number }
@@ -19,7 +20,7 @@ watch(view, (v) => {
 });
 const items = ref<Item[]>([]);
 const st = ref<Stats | null>(null);
-const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+Alt+C", kb_dir_override: "", feishu_webhook: "", feishu_push_daily: false, notion_token: "", notion_db_id: "" });
+const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+Alt+C", kb_dir_override: "", prompt_article: "", prompt_wechat: "", prompt_quote: "", prompt_topics: "", prompt_daily: "", feishu_webhook: "", feishu_push_daily: false, notion_token: "", notion_db_id: "" });
 const bookmarks = ref<Bookmark[]>([]);
 const bmNew = ref({ title: "", url: "" });
 const kbNew = ref("");
@@ -271,6 +272,11 @@ async function saveConfig() {
     baseUrl: cfg.value.base_url,
     apiKey: cfg.value.api_key,
     model: cfg.value.model,
+    promptArticle: cfg.value.prompt_article ?? "",
+    promptWechat: cfg.value.prompt_wechat ?? "",
+    promptQuote: cfg.value.prompt_quote ?? "",
+    promptTopics: cfg.value.prompt_topics ?? "",
+    promptDaily: cfg.value.prompt_daily ?? "",
   });
   showBubble("✓ 设置已保存");
   view.value = "panel";
@@ -783,6 +789,21 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <label>模型名</label>
       <input v-model="cfg.model" placeholder="gpt-4o-mini / deepseek-chat / agnes-chat …" />
       <p class="tip">填 OpenAI 兼容接口即可（chat/completions）。AI 整理知识卡会走这里。</p>
+      <h3 class="sect">🎛️ 成卡/创作预设（AI 提示词模板）</h3>
+      <p class="tip">每类内容用专属模板；留空 = 用内置默认。占位符会被自动替换。</p>
+      <label>文章成卡模板（占位符：{url} {content}）</label>
+      <textarea v-model="cfg.prompt_article" rows="4" placeholder="留空用默认：一句话结论/展开/下一步行动"></textarea>
+      <label>微信文章成卡模板（占位符：{title} {author} {url}）</label>
+      <textarea v-model="cfg.prompt_wechat" rows="4" placeholder="留空用默认：待补全卡模板"></textarea>
+      <label>引用创作模板（占位符：{goal} {snapshot}）</label>
+      <textarea v-model="cfg.prompt_quote" rows="4" placeholder="留空用默认：铁律=只用卡里的事实"></textarea>
+      <label>跨卡选题模板（占位符：{digest}）</label>
+      <textarea v-model="cfg.prompt_topics" rows="3" placeholder="留空用默认：两两碰撞出 5 个选题"></textarea>
+      <label>每日冒泡推送文案模板（占位符：{date} {title} {conclusion} {todos}）</label>
+      <textarea v-model="cfg.prompt_daily" rows="4" placeholder="留空用默认：🐱 每日冒泡 + 今日知识卡 + 待办"></textarea>
+      <div class="rowsep">
+        <button type="button" class="mini" @click="cfg.prompt_article=''; cfg.prompt_wechat=''; cfg.prompt_quote=''; cfg.prompt_topics=''; cfg.prompt_daily=''; showBubble('已清空，保存后恢复内置默认')">↺ 全部恢复默认</button>
+      </div>
       <div class="btns">
         <button type="submit" class="ok">💾 保存</button>
         <button type="button" class="mini" @click="testConfig">🧪 测试连接（用最新一条做真实整理）</button>
