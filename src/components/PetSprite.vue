@@ -1,10 +1,14 @@
 <script setup lang="ts">
 // 多状态 SVG 桌宠：idle / happy / eat / sleep
 // 参考 BongoCat 的状态机思路，但用内联 SVG（Windows 渲染稳定、无白底、零资源依赖）
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 
 type Mood = "idle" | "happy" | "eat" | "sleep";
 const mood = ref<Mood>("idle");
+const emit = defineEmits<{ (e: "mood", m: Mood): void }>();
+// mood 变化同步给外层（petwrap 的 mood-* class 靠它驱动动画）
+watch(mood, m => emit("mood", m), { immediate: true });
+
 let idleTimer: number | undefined;
 let moodTimer: number | undefined;
 
@@ -20,6 +24,10 @@ function poke(m: Mood, ms = 1200) {
   armSleep();
 }
 function wake() { if (mood.value === "sleep") mood.value = "idle"; armSleep(); }
+// 鼠标悬停：在睡觉就开心地醒过来（弹一下+笑），醒着只续命不折腾
+function hoverWake() {
+  if (mood.value === "sleep") { poke("happy", 900); } else { armSleep(); }
+}
 
 onMounted(() => {
   armSleep();
@@ -27,17 +35,17 @@ onMounted(() => {
 });
 onUnmounted(() => { clearTimeout(idleTimer); clearTimeout(moodTimer); });
 
-defineExpose({ poke });
+defineExpose({ poke, wake, hoverWake });
 
 // 眼睛：happy/eat 闭眼弧线，idle 圆眼，sleep 缝眼
 const eyes = computed(() => mood.value === "happy" || mood.value === "eat" ? "closed" : mood.value === "sleep" ? "sleep" : "open");
 const mouth = computed(() => mood.value === "happy" ? "smile" : mood.value === "eat" ? "open" : mood.value === "sleep" ? "zzz" : "w");
-// 尾巴摆动参数：sleep 时停
-const tailDur = computed(() => mood.value === "sleep" ? "0s" : "1.6s");
+// 尾巴摆动：sleep 时完全停摆（0s 时长的动画会残留一帧，干脆 none）
+const tailAnim = computed(() => mood.value === "sleep" ? "none" : "tailswing 1.6s ease-in-out infinite alternate");
 </script>
 
 <template>
-  <svg class="pet-svg" viewBox="0 0 120 110" width="110" height="100" aria-hidden="true">
+  <svg class="pet-svg" viewBox="0 0 120 110" width="110" height="100" aria-hidden="true" @pointerenter="hoverWake">
     <defs>
       <radialGradient id="bodyG" cx="40%" cy="30%" r="80%">
         <stop offset="0%" stop-color="#fdeedd"/>
@@ -52,7 +60,7 @@ const tailDur = computed(() => mood.value === "sleep" ? "0s" : "1.6s");
     <!-- 尾巴（摆动动画） -->
     <path class="tail" d="M96 82 Q116 76 112 58 Q110 50 104 54"
       fill="none" stroke="#d99a5e" stroke-width="7" stroke-linecap="round"
-      :style="{ animation: tailDur ? `tailswing ${tailDur} ease-in-out infinite alternate` : 'none' }"/>
+      :style="{ animation: tailAnim }"/>
 
     <!-- 身体 -->
     <ellipse cx="56" cy="82" rx="34" ry="22" fill="url(#bodyG)"/>
@@ -72,10 +80,12 @@ const tailDur = computed(() => mood.value === "sleep" ? "0s" : "1.6s");
 
       <!-- 眼睛 -->
       <template v-if="eyes === 'open'">
-        <circle cx="45" cy="42" r="4.5" fill="#33261a"/>
-        <circle cx="67" cy="42" r="4.5" fill="#33261a"/>
-        <circle cx="46.6" cy="40.4" r="1.4" fill="#fff"/>
-        <circle cx="68.6" cy="40.4" r="1.4" fill="#fff"/>
+        <g class="eyes-open">
+          <circle cx="45" cy="42" r="4.5" fill="#33261a"/>
+          <circle cx="67" cy="42" r="4.5" fill="#33261a"/>
+          <circle cx="46.6" cy="40.4" r="1.4" fill="#fff"/>
+          <circle cx="68.6" cy="40.4" r="1.4" fill="#fff"/>
+        </g>
       </template>
       <template v-else-if="eyes === 'closed'">
         <path d="M40 42 Q45 47 50 42" stroke="#33261a" stroke-width="2.4" fill="none" stroke-linecap="round"/>
@@ -95,6 +105,9 @@ const tailDur = computed(() => mood.value === "sleep" ? "0s" : "1.6s");
         <path d="M36 50 L46 51"/><path d="M36 55 L46 54"/>
         <path d="M76 50 L66 51"/><path d="M76 55 L66 54"/>
       </g>
+      <!-- 腮红 -->
+      <ellipse cx="37" cy="58" rx="5" ry="2.6" fill="#ff9d8a" opacity=".45"/>
+      <ellipse cx="75" cy="58" rx="5" ry="2.6" fill="#ff9d8a" opacity=".45"/>
 
       <!-- 嘴 -->
       <template v-if="mouth === 'smile'">
@@ -121,8 +134,22 @@ const tailDur = computed(() => mood.value === "sleep" ? "0s" : "1.6s");
 @keyframes zfloat { from { opacity: .3; transform: translateY(0); } to { opacity: 1; transform: translateY(-3px); } }
 /* 呼吸感：更克制（hallmark: motion has a job——呼吸=活着的最小信号） */
 .petwrap .pet-svg { animation: petbreathe 3.6s ease-in-out infinite; }
-.petwrap.mood-sleep .pet-svg { animation: none; }
 @keyframes petbreathe { 0%,100% { transform: scale(1); } 50% { transform: scale(1.015); } }
-/* 拖拽中：轻微放大+长影（grabbing 反馈） */
-.petwrap.dragging .pet-svg { transform: scale(1.06); filter: drop-shadow(0 10px 14px rgba(0,0,0,.28)); }
+/* 睡觉：换成更慢更深的"打呼"起伏，尾巴停摆（zzz 仍在飘） */
+.petwrap.mood-sleep .pet-svg { animation: petsnore 4.2s ease-in-out infinite; }
+@keyframes petsnore { 0%,100% { transform: scale(1); } 50% { transform: scale(1.03) translateY(1.5px); } }
+/* 开心：Q 弹一下（squash & stretch） */
+.petwrap.mood-happy .pet-svg { animation: petbounce .55s cubic-bezier(.3,1.4,.5,1); }
+@keyframes petbounce {
+  0% { transform: scale(1); } 30% { transform: scale(1.09,.92); }
+  55% { transform: scale(.95,1.06); } 75% { transform: scale(1.03,.98); } 100% { transform: scale(1); }
+}
+/* 吃饭：小脑袋一点一点 */
+.petwrap.mood-eat .pet-svg { animation: peteat .5s ease-in-out infinite; }
+@keyframes peteat { 0%,100% { transform: translateY(0) scale(1); } 50% { transform: translateY(2.5px) scale(1.01,.99); } }
+/* 眨眼：约 4 秒随机感的一次快眨 */
+.pet-svg .eyes-open { transform-box: fill-box; transform-origin: center; animation: petblink 4.2s infinite; }
+@keyframes petblink { 0%,91%,100% { transform: scaleY(1); } 94% { transform: scaleY(.08); } 97% { transform: scaleY(1); } }
+/* 拖拽中：轻微放大+长影（grabbing 反馈），压过状态动画 */
+.petwrap.dragging .pet-svg { animation: none; transform: scale(1.06); filter: drop-shadow(0 10px 14px rgba(0,0,0,.28)); }
 </style>

@@ -25,12 +25,36 @@ const cfg = ref<AiConfig>({ base_url: "", api_key: "", model: "", hotkey: "Ctrl+
   providers: [], active_provider: 0, image_provider: -1, image_model: "", feishu_webhook: "", feishu_push_daily: false, notion_token: "", notion_db_id: "" });
 const bookmarks = ref<Bookmark[]>([]);
 const bmNew = ref({ title: "", url: "" });
+// 常用网址：搜索 + 卡片视觉（首字母头像、按 URL 生成稳定配色）
+const bmQuery = ref("");
+const bmShown = computed(() => {
+  const q = bmQuery.value.trim().toLowerCase();
+  if (!q) return bookmarks.value;
+  return bookmarks.value.filter(b =>
+    (b.title || "").toLowerCase().includes(q) || b.url.toLowerCase().includes(q));
+});
+function hostOf(u: string) {
+  try {
+    const full = /^[a-z]+:\/\//i.test(u) ? u : "https://" + u;
+    return new URL(full).hostname.replace(/^www\./, "");
+  } catch { return u.replace(/^[a-z]+:\/\//i, "").split("/")[0] || u; }
+}
+function initialOf(b: Bookmark) {
+  const t = (b.title || hostOf(b.url) || "?").trim();
+  return (t[0] || "?").toUpperCase();
+}
+function bmColor(u: string) {
+  let h = 0;
+  for (let i = 0; i < u.length; i++) h = (h * 31 + u.charCodeAt(i)) % 360;
+  return `linear-gradient(135deg, hsl(${h} 68% 60%), hsl(${(h + 42) % 360} 70% 48%))`;
+}
 const kbNew = ref("");
 const isDragging = ref(false);
 const bubble = ref("");
 const bubbleShow = ref(false);
 const busy = ref<Record<string, boolean>>({});
-const filter = ref<"all" | "seed" | "fetched" | "read" | "carded">("all");
+const filter = ref<"all" | "seed" | "fetched" | "read" | "carded" | "fetch-failed">("all");
+const kindFilter = ref<"all" | "url" | "text">("all");
 let bubbleTimer: number | undefined;
 let pollTimer: number | undefined;
 
@@ -65,6 +89,11 @@ function petPoke(mood: "happy" | "eat", ms?: number) {
   petMood.value = mood;
   window.setTimeout(() => { petMood.value = "idle"; }, ms ?? 1200);
 }
+// 右键菜单「睡一会」：手动让它睡着，方便验证"悬停唤醒"
+function petSleep() {
+  petSprite.value?.poke("sleep", 30 * 60 * 1000);
+  showBubble("😴 睡着了，鼠标移过去试试");
+}
 async function quitApp() {
   try {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
@@ -85,8 +114,38 @@ async function openPanelForSettings() {
   } catch (e) { showBubble("⚠️ 打开设置失败"); }
 }
 
+// ---- 收件箱多选 ----
+const sel = ref<Set<string>>(new Set());
+function toggleSel(id: string) {
+  const s = new Set(sel.value);
+  if (s.has(id)) s.delete(id); else s.add(id);
+  sel.value = s;
+}
+function selClear() { sel.value = new Set(); }
+function selAll() {
+  sel.value = (shown.value.length > 0 && sel.value.size === shown.value.length)
+    ? new Set() : new Set(shown.value.map(i => i.id));
+}
+const selItems = computed(() => shown.value.filter(i => sel.value.has(i.id)));
+// 能抓的：网址类且还没抓过
+const selUrlItems = computed(() => selItems.value.filter(i => i.kind === "url" && i.status !== "fetched"));
+const selUrlCount = computed(() => selUrlItems.value.length);
+// 分类计数（按当前类型筛选统计，tab 上带数字）
+const counts = computed(() => {
+  const base = kindFilter.value === "all" ? items.value : items.value.filter(i => i.kind === kindFilter.value);
+  const c: Record<string, number> = { all: base.length, seed: 0, fetched: 0, read: 0, carded: 0, "fetch-failed": 0 };
+  for (const i of base) c[i.status] = (c[i.status] || 0) + 1;
+  return c;
+});
+const kindCounts = computed(() => ({
+  all: items.value.length,
+  url: items.value.filter(i => i.kind === "url").length,
+  text: items.value.filter(i => i.kind === "text").length,
+}));
+
 const shown = computed(() => {
   let arr = filter.value === "all" ? items.value : items.value.filter(i => i.status === filter.value);
+  if (kindFilter.value !== "all") arr = arr.filter(i => i.kind === kindFilter.value);
   if (kwFilter.value) arr = arr.filter(i => (i.keywords || "").includes(kwFilter.value));
   return arr;
 });
@@ -94,6 +153,11 @@ const shown = computed(() => {
 async function refresh() {
   items.value = await invoke<Item[]>("list_items");
   st.value = await invoke<Stats>("stats");
+  // 清理已不存在的选中项
+  if (sel.value.size) {
+    const alive = new Set(items.value.map(i => i.id));
+    sel.value = new Set([...sel.value].filter(id => alive.has(id)));
+  }
   try { await loadCards(); } catch { /* 旧库无 30-notes */ }
 }
 
@@ -170,8 +234,75 @@ async function crawlAll() {
   refresh();
 }
 
-async function makeCard(it: Item) {
-  busy.value[it.id] = true;
+// ---- 多选批量操作 ----
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// 单条抓正文
+async function crawlItem(it: Item) {
+  busy.value = { ...busy.value, [it.id]: true };
+  showBubble("🕷 抓取中…");
+  try { showBubble("✅ " + await invoke<string>("fetch_item", { id: it.id })); }
+  catch (e) { showBubble("⚠️ " + String(e).slice(0, 100)); }
+  busy.value = { ...busy.value, [it.id]: false };
+  refresh();
+}
+
+// 抓取：优先抓「勾选的网页项」，没勾选则回落到全局队列
+async function crawlSelected() {
+  const list = selUrlItems.value.slice();
+  if (!list.length) {
+    if (st.value?.queue) return crawlAll();
+    showBubble("⚠️ 先在下面勾选要抓取的网页"); return;
+  }
+  busy.value = { ...busy.value, crawl: true };
+  let ok = 0, fail = 0;
+  for (let i = 0; i < list.length; i++) {
+    showBubble(`🕷 抓取中 ${i + 1}/${list.length}：${list[i].title.slice(0, 18)}`);
+    try { await invoke<string>("fetch_item", { id: list[i].id }); ok++; }
+    catch (e) { fail++; console.warn("抓取失败", list[i].id, e); }
+    if (i < list.length - 1) await sleep(2000); // 防限流
+  }
+  busy.value = { ...busy.value, crawl: false };
+  showBubble(`✅ 抓取完成：成功 ${ok}${fail ? `，失败 ${fail}` : ""}`);
+  sel.value = new Set();
+  refresh();
+}
+
+async function batchMakeCards() {
+  const list = selItems.value.slice();
+  if (!list.length) return;
+  busy.value = { ...busy.value, batch: true };
+  let ok = 0;
+  for (let i = 0; i < list.length; i++) {
+    showBubble(`✨ AI 成卡 ${i + 1}/${list.length}`);
+    try { await invoke<string>("ai_make_card", { id: list[i].id }); ok++; } catch {}
+  }
+  busy.value = { ...busy.value, batch: false };
+  showBubble(`✅ 已生成 ${ok}/${list.length} 张卡`);
+  sel.value = new Set();
+  refresh();
+}
+
+async function batchMarkRead() {
+  const list = selItems.value.slice();
+  for (const it of list) { try { await invoke("mark_read", { id: it.id }); } catch {} }
+  showBubble(`👁 已标记 ${list.length} 项已读`);
+  sel.value = new Set();
+  refresh();
+}
+
+async function batchDelete() {
+  const list = selItems.value.slice();
+  if (!list.length) return;
+  if (!confirm(`确认删除选中的 ${list.length} 项？删除后不可恢复（文件会被移除）`)) return;
+  let ok = 0;
+  for (const it of list) { try { await invoke<string>("delete_item", { id: it.id }); ok++; } catch {} }
+  showBubble(`🗑 已删除 ${ok} 项`);
+  sel.value = new Set();
+  refresh();
+}
+
+async function makeCard(it: Item) {  busy.value[it.id] = true;
   try {
     showBubble("✨ " + await invoke<string>("ai_make_card", { id: it.id }));
   } catch (e) { showBubble("⚠️ " + String(e)); }
@@ -195,8 +326,12 @@ async function loadBookmarks() {
 }
 
 async function addBm() {
+  const raw = bmNew.value.url.trim();
+  if (!raw) return;
+  // 允许只输 github.com 这类裸域名，自动补 https://
+  const url = /^https?:\/\//i.test(raw) ? raw : "https://" + raw;
   try {
-    await invoke("add_bookmark", { title: bmNew.value.title, url: bmNew.value.url });
+    await invoke("add_bookmark", { title: bmNew.value.title.trim(), url });
     bmNew.value = { title: "", url: "" };
     showBubble("✓ 已加入常用网址");
     loadBookmarks();
@@ -204,6 +339,8 @@ async function addBm() {
 }
 
 async function delBm(url: string) {
+  const b = bookmarks.value.find(x => x.url === url);
+  if (!confirm(`确定移除「${b?.title || hostOf(url)}」？`)) return;
   await invoke("remove_bookmark", { url });
   loadBookmarks();
 }
@@ -389,6 +526,10 @@ function toggleWx(url: string) {
   if (s.has(url)) s.delete(url); else s.add(url);
   wxPicked.value = s;
 }
+function wxPickAll() {
+  wxPicked.value = (wxArts.value.length > 0 && wxPicked.value.size === wxArts.value.length)
+    ? new Set() : new Set(wxArts.value.map(a => a.url));
+}
 async function wxScan() {
   wxBusy.value = "scan"; wxMsg.value = "读取微信浏览记录中…"; wxProgStart(0);
   try {
@@ -537,6 +678,11 @@ async function pushWeekly() {
 const statusText: Record<string, string> = {
   seed: "🌱 新收", fetched: "📄 已爬正文", "fetch-failed": "❌ 抓取失败",
   read: "👁 已读", carded: "✨ 已成卡",
+};
+// 筛选条用的短标签（窗口窄时不挤爆一行，完整文案放 title）
+const shortStatus: Record<string, string> = {
+  seed: "🌱 新收", fetched: "📄 已爬", read: "👁 已读",
+  carded: "✨ 成卡", "fetch-failed": "❌ 失败",
 };
 
 onMounted(async () => {
@@ -688,6 +834,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <button @click="menuShow = false; petClick()">📥 收藏剪贴板</button>
       <button @click="menuShow = false; bowlClick()">🍚 喂食（收进食盆）</button>
       <button @click="menuShow = false; openPanel()">📚 管理面板</button>
+      <button @click="menuShow = false; petSleep()">😴 睡一会</button>
       <button @click="menuShow = false; openPanelForSettings()">⚙ 设置</button>
       <button class="danger" @click="menuShow = false; quitApp()">🚪 退出</button>
     </div>
@@ -699,13 +846,33 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
 
     <!-- 宠物+食盆横排（同窗联动） -->
     <div class="petrow">
-      <!-- 宠物（单击=收藏，双击=面板） -->
-      <div class="pet" @dblclick="openPanel" @pointerdown="petDrag" title="按住拖动 / 双击面板 / 右键菜单">
-        <PetSprite ref="petSprite" />
+      <!-- 宠物（悬停唤醒：睡觉时移过去会开心地弹醒；单击=收藏，双击=面板） -->
+      <div class="pet" @dblclick="openPanel" @pointerdown="petDrag" @pointerenter="petSprite?.hoverWake()" title="按住拖动 / 双击面板 / 右键菜单">
+        <PetSprite ref="petSprite" @mood="(m: string) => petMood = m" />
       </div>
-      <!-- 食盆：有排队内容时冒星 -->
+      <!-- 食盆：有排队内容时冒星（悬停晃一晃） -->
       <div class="bowl" :class="{ 'has-queue': st && st.queue > 0 }" @click="bowlClick" title="点食盆喂食 = 收藏剪贴板">
-        🍚
+        <svg class="bowl-svg" viewBox="0 0 72 48" width="64" height="43" aria-hidden="true">
+          <defs>
+            <linearGradient id="bowlG" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#F2926A"/>
+              <stop offset="1" stop-color="#D96F45"/>
+            </linearGradient>
+          </defs>
+          <!-- 米饭堆 -->
+          <g class="rice">
+            <circle cx="26" cy="18" r="8" fill="#FFFDF6" stroke="#EBD9BE" stroke-width="1.4"/>
+            <circle cx="38" cy="13.5" r="9" fill="#FFFDF6" stroke="#EBD9BE" stroke-width="1.4"/>
+            <circle cx="48" cy="19" r="7.5" fill="#FFFDF6" stroke="#EBD9BE" stroke-width="1.4"/>
+            <circle cx="33" cy="22" r="8" fill="#FFFDF6" stroke="#EBD9BE" stroke-width="1.4"/>
+            <circle cx="43" cy="23" r="7" fill="#FFFDF6" stroke="#EBD9BE" stroke-width="1.4"/>
+          </g>
+          <!-- 碗身 + 碗沿 + 高光 -->
+          <path d="M10 25 A26 22 0 0 0 62 25 Z" fill="url(#bowlG)"/>
+          <ellipse cx="24" cy="34" rx="7" ry="4" fill="#FFFFFF" opacity=".18" transform="rotate(-18 24 34)"/>
+          <rect x="8" y="21.5" width="56" height="5.5" rx="2.75" fill="#C75B36"/>
+          <rect x="13" y="22.6" width="26" height="1.6" rx=".8" fill="#FFFFFF" opacity=".22"/>
+        </svg>
         <span v-if="st && st.queue > 0" class="queue-star">⭐</span>
       </div>
     </div>
@@ -717,8 +884,11 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
   <div v-else-if="view === 'panel'" class="panel shell">
     <aside class="sidenav">
       <div class="sidehead">
-        <b>📚 知识收藏</b>
-        <button class="mini" @click="backToPet">🐱 回桌宠</button>
+        <div class="brand">
+          <span class="brand-ico">📚</span>
+          <span class="brand-txt"><b>知识收藏</b><em>Knowledge Pet</em></span>
+        </div>
+        <button class="sideitem back" @click="backToPet">🐱 返回桌宠</button>
       </div>
       <button class="sideitem" :class="{ on: navTab === 'inbox' }" @click="navTab = 'inbox'">📥 采集</button>
       <button class="sidesub" :class="{ on: navTab === 'wx' }" @click="navTab = 'wx'">微信文章采集</button>
@@ -733,24 +903,21 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
     </aside>
     <main class="sidecontent">
 <div class="statrow" v-if="st">
-      <span>共 {{ st.total }}</span>
-      <span>🌱 {{ st.seed }}</span>
-      <span>📄 {{ st.fetched }}</span>
-      <span>👁 {{ st.read }}</span>
-      <span>✨ {{ st.carded }}</span>
-      <span>❌ {{ st["fetch-failed"] }}</span>
-      <span>🗂 知识卡 {{ st.notes }}</span>
-      <button class="mini" :disabled="!st.queue" @click="crawlAll">🕷 抓取队列({{ st.queue }})</button>
-      <button class="mini" @click="pasteBox = !pasteBox">📋 贴文本抠链接</button>
-    </div>
-    <div v-if="pasteBox" style="margin:0 16px 8px">
-      <textarea v-model="pasteText" rows="3" placeholder="把含链接的一段话/聊天记录/笔记粘进来，自动抠出所有 URL 去重入队" style="width:100%;font-size:12px"></textarea>
-      <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
-        <button class="mini ok" :disabled="!pasteText.trim()" @click="capturePaste">🔍 抠出链接入队</button>
-        <span v-if="pasteMsg" class="mut" style="font-size:12px">{{ pasteMsg }}</span>
+      <span class="chip">共 {{ st.total }}</span>
+      <span class="chip">🌱 {{ st.seed }}</span>
+      <span class="chip">📄 {{ st.fetched }}</span>
+      <span class="chip">👁 {{ st.read }}</span>
+      <span class="chip">✨ {{ st.carded }}</span>
+      <span class="chip" :class="{ warn: st['fetch-failed'] > 0 }">❌ {{ st["fetch-failed"] }}</span>
+      <span class="chip">🗂 {{ st.notes }}</span>
+      <div class="statrow-actions">
+        <button class="mini ok crawlbtn" :disabled="busy.crawl || (!selUrlCount && !st.queue)" @click="crawlSelected"
+          :title="selUrlCount ? `抓取下面勾选的 ${selUrlCount} 个网页` : '抓取 fetch 队列里的待抓记录'">
+          {{ busy.crawl ? "🕷 抓取中…" : `🕷 抓取队列(${selUrlCount || st.queue})` }}
+        </button>
+        <button class="mini" @click="pasteBox = !pasteBox">📋 贴文本抠链接</button>
       </div>
     </div>
-
     <div v-if="pasteBox" style="margin:0 16px 8px">
       <textarea v-model="pasteText" rows="3" placeholder="把含链接的一段话/聊天记录/笔记粘进来，自动抠出所有 URL 去重入队" style="width:100%;font-size:12px"></textarea>
       <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
@@ -760,26 +927,58 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
     </div>
 
     <template v-if="navTab === 'inbox'">
-<div class="filters">
-      <button v-for="f in ['all','seed','fetched','read','carded']" :key="f"
-        :class="{ active: filter === f }" @click="filter = f as any">
-        {{ f === 'all' ? '全部' : statusText[f] }}
+<!-- 分类：状态 + 类型 -->
+    <div class="filterbar">
+      <div class="fgroups">
+        <div class="fgroup">
+          <button v-for="f in ['all','seed','fetched','read','carded','fetch-failed']" :key="f"
+            :class="{ active: filter === f }" :title="f === 'all' ? '全部' : statusText[f]"
+            @click="filter = f as any">
+            {{ f === 'all' ? '全部' : shortStatus[f] }}
+            <i v-if="counts[f]">{{ counts[f] }}</i>
+          </button>
+        </div>
+        <div class="fgroup kinds">
+          <button v-for="k in ['all','url','text']" :key="k" :class="{ active: kindFilter === k }" @click="kindFilter = k as any">
+            {{ k === 'all' ? '全部类型' : k === 'url' ? '🌐 网页' : '📝 文本' }}
+            <i>{{ (kindCounts as any)[k] }}</i>
+          </button>
+        </div>
+      </div>
+      <button class="mini pickall" :disabled="!shown.length" @click="selAll"
+        :title="sel.size > 0 && sel.size === shown.length ? '取消全选本页' : '全选本页'">
+        {{ sel.size > 0 && sel.size === shown.length ? '☐ 取消' : '☑ 全选' }}
       </button>
     </div>
 
+<!-- 多选批量操作条 -->
+    <div v-if="sel.size" class="selbar">
+      <span class="selcount">已选 <b>{{ sel.size }}</b> 项<i v-if="selUrlCount">（{{ selUrlCount }} 个待抓网页）</i></span>
+      <div class="selbar-actions">
+        <button v-if="selUrlCount" class="mini ok" :disabled="busy.crawl" @click="crawlSelected">🕷 抓正文</button>
+        <button class="mini ok" :disabled="busy.batch" @click="batchMakeCards">✨ AI 成卡</button>
+        <button class="mini" @click="batchMarkRead">👁 标记已读</button>
+        <button class="mini danger" @click="batchDelete">🗑 删除</button>
+        <button class="mini ghost" @click="selClear()">取消</button>
+      </div>
+    </div>
+
     <div class="list">
-      <div v-for="it in shown" :key="it.id" class="card">
-        <div class="row1">
-          <span class="badge" :class="it.kind">{{ it.kind === 'url' ? '🌐' : '📝' }}</span>
-          <b class="title">{{ it.title }}</b>
-          <span class="st">{{ statusText[it.status] || it.status }}</span>
-        </div>
-        <a v-if="it.url" class="url" :href="it.url" target="_blank">{{ it.url }}</a>
-        <div class="btns">
-          <button v-if="it.status === 'seed' && it.kind === 'url'" class="mini" @click="crawlAll">🕷 抓正文</button>
-          <button class="mini ok" :disabled="busy[it.id]" @click="makeCard(it)">✨ AI 整理成卡</button>
-          <button v-if="it.status !== 'read' && it.status !== 'carded'" class="mini" @click="markRead(it)">👁 标记已读</button>
-          <button class="mini danger" @click="delItem(it)">🗑 删除</button>
+      <div v-for="it in shown" :key="it.id" class="card inbox-card" :class="{ picked: sel.has(it.id) }" @click="toggleSel(it.id)">
+        <input type="checkbox" class="pickbox" :checked="sel.has(it.id)" @click.stop="toggleSel(it.id)" />
+        <div class="cardbody">
+          <div class="row1">
+            <span class="badge" :class="it.kind">{{ it.kind === 'url' ? '🌐' : '📝' }}</span>
+            <b class="title" :title="it.title">{{ it.title }}</b>
+            <span class="st" :class="'st-' + it.status">{{ statusText[it.status] || it.status }}</span>
+          </div>
+          <a v-if="it.url" class="url" :href="it.url" target="_blank" @click.stop>{{ it.url }}</a>
+          <div class="btns" @click.stop>
+            <button v-if="it.kind === 'url' && it.status !== 'fetched'" class="mini" :disabled="busy[it.id]" @click="crawlItem(it)">🕷 抓正文</button>
+            <button class="mini ok" :disabled="busy[it.id]" @click="makeCard(it)">✨ AI 整理成卡</button>
+            <button v-if="it.status !== 'read' && it.status !== 'carded'" class="mini" @click="markRead(it)">👁 标记已读</button>
+            <button class="mini danger" @click="delItem(it)">🗑 删除</button>
+          </div>
         </div>
       </div>
       <p v-if="!shown.length" class="empty">空空如也。去别的窗口复制点东西，然后点一下桌宠 🐱</p>
@@ -836,6 +1035,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
           <option :value="14">14 天</option><option :value="30">30 天</option><option :value="90">90 天</option>
         </select> 浏览</label>
         <button class="mini" :disabled="!!wxBusy" @click="wxScan">{{ wxBusy === 'scan' ? "读取中…" : "🔍 抓取浏览记录" }}</button>
+        <button class="mini" :disabled="!wxArts.length" @click="wxPickAll">{{ wxPicked.size > 0 && wxPicked.size === wxArts.length ? "☐ 全不选" : "☑ 全选" }}</button>
         <button class="mini ok" :disabled="!!wxBusy || !wxPicked.size" @click="wxSave">📥 存收件箱 ({{ wxPicked.size }})</button>
         <button class="mini ok" :disabled="!!wxBusy || !wxPicked.size" @click="wxCards">🤖 AI 成卡 ({{ wxPicked.size }})</button>
         <button class="mini" :disabled="!!wxBusy" @click="wxExport" title="导出公众号列表 JSON，供评论寻客导入">📤 导出公众号</button>
@@ -844,7 +1044,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
       <p v-if="wxMsg" class="wxmsg" :class="wxMsg.startsWith('❌') ? 'err' : wxMsg.startsWith('✅') ? 'ok' : 'busy'">{{ wxMsg }}</p>
       <div v-for="a in wxArts" :key="a.url" class="mut" style="margin:4px 0;font-size:12px;display:flex;align-items:center;gap:6px">
         <input type="checkbox" :checked="wxPicked.has(a.url)" @change="toggleWx(a.url)" style="margin:0" />
-        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left" :title="a.url">📰 {{ a.title !== '(无标题)' ? a.title : a.url.replace(/^https?:\/\//,'').slice(0,60) }}</span>
+        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left" :title="a.title">📰 {{ a.title }}</span>
         <span class="mut" style="white-space:nowrap">{{ a.author || '未知号' }} · {{ a.time }}</span>
       </div>
       <p v-if="!wxArts.length" class="mut" style="font-size:12px">点「抓取浏览记录」读取你在微信里看过的公众号文章（只读本地记录，需 Windows + 微信 4.x）</p>
@@ -871,18 +1071,56 @@ onUnmounted(() => { clearInterval(pollTimer); clearTimeout(bubbleTimer); clearIn
 
     </template>
 <template v-else-if="navTab === 'marks'">
-<h3 class="bmtitle">⭐ 常用网址</h3>
-    <div class="bmform">
-      <input v-model="bmNew.title" placeholder="名称（可空）" class="bm-title" />
-      <input v-model="bmNew.url" placeholder="https://…  网址" class="bm-url" @keyup.enter="addBm" />
-      <button class="mini ok" @click="addBm">＋ 添加</button>
-    </div>
-    <div class="bmgrid">
-      <div v-for="b in bookmarks" :key="b.url" class="bmitem">
-        <a :href="b.url" target="_blank" class="bmlink">{{ b.title }}</a>
-        <button class="mini danger" @click="delBm(b.url)">✕</button>
+<div class="markspage">
+      <!-- 页头 -->
+      <div class="mkhead">
+        <div class="mkhead-l">
+          <span class="mkhead-ico">⭐</span>
+          <div>
+            <h3>常用网址</h3>
+            <p>把自己常逛的站点收在这里，点卡片直接打开</p>
+          </div>
+        </div>
+        <div class="mkhead-r">
+          <span class="mkcnt">{{ bookmarks.length }} 个</span>
+          <input v-if="bookmarks.length > 3 || bmQuery" v-model="bmQuery" class="mksearch" placeholder="🔍 搜索名称 / 域名" />
+        </div>
       </div>
-      <p v-if="!bookmarks.length" class="empty2">还没有常用网址</p>
+
+      <!-- 添加区 -->
+      <div class="mkadd">
+        <label class="mkfield">
+          <span class="mkpin">🏷</span>
+          <input v-model="bmNew.title" placeholder="名称（可空，自动取域名）" @keyup.enter="addBm" />
+        </label>
+        <label class="mkfield grow">
+          <span class="mkpin">🔗</span>
+          <input v-model="bmNew.url" placeholder="https://example.com" @keyup.enter="addBm" />
+        </label>
+        <button class="mkaddbtn" :disabled="!bmNew.url.trim()" @click="addBm">＋ 添加</button>
+      </div>
+
+      <!-- 网址卡片 -->
+      <div v-if="bmShown.length" class="mkgrid">
+        <div v-for="b in bmShown" :key="b.url" class="mkcard" :title="b.url">
+          <a class="mkbody" :href="b.url" target="_blank">
+            <span class="mkava" :style="{ backgroundImage: bmColor(b.url) }">{{ initialOf(b) }}</span>
+            <span class="mkinfo">
+              <b class="mkname">{{ b.title || hostOf(b.url) }}</b>
+              <em class="mkhost">{{ hostOf(b.url) }}</em>
+            </span>
+          </a>
+          <button class="mkdel" title="移除" @click.stop="delBm(b.url)">✕</button>
+        </div>
+      </div>
+
+      <!-- 空态 -->
+      <div v-else-if="!bookmarks.length" class="mkempty">
+        <div class="mkempty-ico">🔖</div>
+        <b>还没有常用网址</b>
+        <p>在上面填个网址试试 —— 常用后台、文档站、AI 工具首页都适合放这儿。</p>
+      </div>
+      <p v-else class="mkempty-tip">没有匹配「{{ bmQuery }}」的网址</p>
     </div>
 
   </template>
@@ -1041,11 +1279,17 @@ html, body { background: transparent !important; margin: 0; padding: 0; border: 
 #app { background: transparent !important; border: 0; outline: none; }
 body { font-family: system-ui, "Microsoft YaHei"; overflow: hidden; }
 
-/* 食盆（同窗） */
-.bowl { font-size: 34px; cursor: pointer; user-select: none; filter: drop-shadow(0 2px 4px rgba(0,0,0,.35)); transition: transform .15s; position: relative; line-height: 1; }
-.bowl:hover { transform: scale(1.12); }
-.bowl:active { transform: scale(0.9); }
-.bowl .queue-star { position: absolute; top: -10px; right: -8px; font-size: 14px; animation: starpop 1.4s ease-in-out infinite; }
+/* 食盆（同窗，SVG 碗） */
+.bowl { position: relative; cursor: pointer; user-select: none; line-height: 0; transition: transform .15s; }
+.bowl:hover { transform: scale(1.1) translateY(-1px); }
+.bowl:active { transform: scale(0.92); }
+.bowl-svg { display: block; filter: drop-shadow(0 3px 5px rgba(0,0,0,.32)); transform-box: fill-box; transform-origin: 50% 88%; }
+.bowl:hover .bowl-svg { animation: bowlwobble .55s ease; }
+@keyframes bowlwobble { 0%,100% { transform: rotate(0); } 25% { transform: rotate(-5deg); } 55% { transform: rotate(4deg); } 80% { transform: rotate(-2deg); } }
+/* 排队有货：星星冒泡 + 碗轻微弹跳示意"有吃的" */
+.bowl.has-queue .bowl-svg { animation: bowlwiggle 2.6s ease-in-out infinite; }
+@keyframes bowlwiggle { 0%,88%,100% { transform: rotate(0); } 92% { transform: rotate(-3deg); } 96% { transform: rotate(3deg); } }
+.bowl .queue-star { position: absolute; top: -12px; right: -6px; font-size: 15px; line-height: 1; filter: drop-shadow(0 1px 2px rgba(0,0,0,.3)); animation: starpop 1.4s ease-in-out infinite; }
 @keyframes starpop { 0%,100% { transform: translateY(0) scale(1); opacity: .7; } 50% { transform: translateY(-4px) scale(1.25); opacity: 1; } }
 /* 进度条 */
 .progwrap { height: 8px; background: #eee; border-radius: 999px; margin: 10px 0 4px; overflow: hidden; }
@@ -1069,7 +1313,7 @@ body { font-family: system-ui, "Microsoft YaHei"; overflow: hidden; }
 .pet-menu button { border: 0; background: none; text-align: left; padding: 8px 12px; font-size: 13px; border-radius: 9px; cursor: pointer; color: #4a3a2a; opacity: 0; animation: menuItemIn .22s ease-out forwards; transition: background-color .12s ease-out; }
 .pet-menu button:nth-child(1) { animation-delay: 0ms; } .pet-menu button:nth-child(2) { animation-delay: 30ms; }
 .pet-menu button:nth-child(3) { animation-delay: 60ms; } .pet-menu button:nth-child(4) { animation-delay: 90ms; }
-.pet-menu button:nth-child(5) { animation-delay: 120ms; }
+.pet-menu button:nth-child(5) { animation-delay: 120ms; } .pet-menu button:nth-child(6) { animation-delay: 150ms; }
 @keyframes menuItemIn { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
 .pet-menu button:hover { background: #fdf0e2; }
 .pet-menu button:active { transform: translateY(1px); }
@@ -1128,22 +1372,72 @@ body { font-family: system-ui, "Microsoft YaHei"; overflow: hidden; }
 .panel > header .mini { padding: 6px 14px; }
 /* 状态统计行 → 浅灰数据条 */
 .statrow {
-  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
-  margin: 0 20px 10px; padding: 10px 14px;
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  margin: 0 20px 12px; padding: 8px 12px;
   background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px;
   font-size: 12.5px; color: #64748B;
 }
 .statrow span { padding: 2px 8px; background: #F9FAFB; border-radius: 6px; }
 .statrow .mini { margin-left: auto; }
+.statrow .chip { background: #F8FAFC; border: 1px solid #F1F5F9; }
+.statrow .chip.warn { background: #FEF2F2; border-color: #FEE2E2; color: #B91C1C; }
+.statrow-actions { margin-left: auto; display: flex; gap: 6px; }
+.statrow-actions .mini { margin-left: 0; }
+.crawlbtn { font-weight: 600; }
+
+/* 分类：状态 + 类型两段 */
+.filterbar { display: flex; align-items: center; gap: 10px; margin: 0 20px 10px; flex-wrap: wrap; }
+.fgroups { display: flex; gap: 8px; flex-wrap: wrap; flex: 1; min-width: 0; }
+.fgroup { display: inline-flex; gap: 2px; background: #F1F5F9; border-radius: 999px; padding: 3px; }
+.fgroup button {
+  border: 0; background: transparent; color: #64748B; font-size: 12.5px; padding: 4px 11px;
+  border-radius: 999px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+  transition: background .12s, color .12s;
+}
+.fgroup button:hover { color: #0F172A; }
+.fgroup button i { font-style: normal; font-size: 11px; background: #E2E8F0; color: #64748B; border-radius: 999px; padding: 0 6px; line-height: 16px; }
+.fgroup button.active { background: #FFFFFF; color: #0F172A; font-weight: 600; box-shadow: 0 1px 3px rgba(15,23,42,.10); }
+.fgroup button.active i { background: #DCFCE7; color: #15803D; }
+.fgroup.kinds { background: #F8FAFC; border: 1px solid #E2E8F0; }
+.pickall { flex: 0 0 auto; }
+
+/* 多选批量操作条 */
+.selbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 20px 10px; padding: 8px 12px;
+  background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 10px;
+  font-size: 12.5px; color: #166534;
+}
+.selbar b { color: #15803D; }
+.selbar i { font-style: normal; color: #16A34A; margin-left: 2px; }
+.selbar-actions { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+.mini.ghost { background: transparent; border-style: dashed; color: #64748B; }
+
+/* 收件箱卡片：可点选 + 状态胶囊 */
+.inbox-card { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; transition: border-color .12s, box-shadow .12s; }
+.inbox-card:hover { border-color: #CBD5E1; box-shadow: 0 2px 10px rgba(15,23,42,.05); }
+.inbox-card.picked { border-color: #07C160; background: #F7FEF9; box-shadow: 0 0 0 2px rgba(7,193,96,.12); }
+.pickbox { margin-top: 3px; width: 15px; height: 15px; accent-color: #07C160; flex: 0 0 auto; cursor: pointer; }
+.cardbody { flex: 1; min-width: 0; }
+.inbox-card .title { text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inbox-card .url { text-align: left; }
+.st { flex: 0 0 auto; font-size: 11.5px; padding: 2px 8px; border-radius: 999px; background: #F1F5F9; color: #64748B; white-space: nowrap; }
+.st-seed { background: #FFF7ED; color: #C2410C; }
+.st-fetched { background: #EFF6FF; color: #1D4ED8; }
+.st-read { background: #F1F5F9; color: #475569; }
+.st-carded { background: #F0FDF4; color: #15803D; }
+.st-fetch-failed { background: #FEF2F2; color: #B91C1C; }
 /* 筛选 tabs */
 .filters { display: flex; gap: 6px; margin: 0 20px 12px; flex-wrap: wrap; }
 .filters button { border-radius: 999px; padding: 5px 14px; }
 .filters button.active { background: #07C160; border-color: #07C160; color: #fff; }
 /* 内容卡 */
 .card {
-  background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px;
+  background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px;
   padding: 12px 14px; margin: 0 20px 10px;
+  transition: border-color .15s, box-shadow .15s;
 }
+.card:hover { border-color: #D8E4DC; box-shadow: 0 4px 14px -9px rgba(15,23,42,.25); }
 .row1 { display: flex; align-items: center; gap: 8px; }
 .title { flex: 1; font-size: 13.5px; color: #0F172A; font-weight: 500; }
 .st { font-size: 12px; color: #94A3B8; }
@@ -1169,15 +1463,90 @@ body { font-family: system-ui, "Microsoft YaHei"; overflow: hidden; }
 }
 .panel input::placeholder { color: #94A3B8; }
 /* 常用网址 */
-.bmform { display: flex; gap: 6px; margin: 0 20px 10px; }
-.bmform .bm-title { width: 160px; }
-.bmform .bm-url { flex: 1; }
-.bmgrid { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 20px; }
-.bmitem { display: flex; align-items: center; gap: 6px; background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 999px; padding: 6px 12px; }
-.bmitem:hover { border-color: #CBD5E1; }
-.bmlink { font-size: 13px; color: #07C160; text-decoration: none; }
-.bmlink:hover { text-decoration: underline; }
-.bmitem .mini.danger { padding: 2px 8px; border-radius: 999px; }
+.markspage { text-align: left; padding: 2px 4px 28px; }
+.mkhead { display: flex; align-items: center; gap: 12px; margin: 0 0 12px; flex-wrap: wrap; }
+.mkhead-l { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+.mkhead-ico {
+  width: 36px; height: 36px; border-radius: 11px; flex: none;
+  display: flex; align-items: center; justify-content: center; font-size: 17px;
+  background: linear-gradient(135deg, #FFF8E1, #FFE9AE); border: 1px solid #FDE68A;
+}
+.mkhead h3 { margin: 0; font-size: 15px; font-weight: 600; color: #0F172A; }
+.mkhead p { margin: 2px 0 0; font-size: 12px; color: #94A3B8; }
+.mkhead-r { display: flex; align-items: center; gap: 8px; }
+.mkcnt { font-size: 11.5px; color: #15803D; background: #DCFCE7; border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
+.panel .mksearch {
+  width: 190px; height: 32px; padding: 0 12px; border: 1px solid #E2E8F0; border-radius: 999px;
+  font-size: 12.5px; color: #0F172A; background: #fff; outline: none;
+  transition: border-color .12s, box-shadow .12s;
+}
+.panel .mksearch::placeholder { color: #A8B3C4; }
+.panel .mksearch:focus { border-color: #07C160; box-shadow: 0 0 0 3px rgba(7,193,96,.12); }
+
+/* 添加区 */
+.mkadd {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  padding: 10px 12px; margin-bottom: 16px;
+  background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 12px;
+}
+.mkfield {
+  display: flex; align-items: center; gap: 6px; height: 36px; padding: 0 10px;
+  width: 210px; background: #fff; border: 1px solid #E2E8F0; border-radius: 9px;
+  transition: border-color .12s, box-shadow .12s;
+}
+.mkfield.grow { flex: 1; min-width: 220px; width: auto; }
+.mkfield:focus-within { border-color: #07C160; box-shadow: 0 0 0 3px rgba(7,193,96,.12); }
+.mkpin { font-size: 12px; opacity: .75; flex: none; }
+.panel .mkfield input {
+  flex: 1; min-width: 0; height: 100%; border: 0; outline: none; background: transparent;
+  padding: 0; font-size: 13px; color: #0F172A; box-shadow: none;
+}
+.panel .mkfield input::placeholder { color: #A8B3C4; }
+.panel .mkfield input:focus { border-color: transparent; box-shadow: none; }
+.panel .mkaddbtn {
+  height: 36px; padding: 0 18px; border: 0; border-radius: 9px;
+  background: #07C160; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: background .12s, transform .08s; flex: none;
+}
+.panel .mkaddbtn:hover:not(:disabled) { background: #06AD56; }
+.panel .mkaddbtn:active:not(:disabled) { transform: translateY(1px); }
+.panel .mkaddbtn:disabled { background: #CBD5E1; cursor: not-allowed; }
+
+/* 卡片网格 */
+.mkgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(228px, 1fr)); gap: 10px; }
+.mkcard {
+  position: relative; display: flex; background: #fff;
+  border: 1px solid #E2E8F0; border-radius: 12px; overflow: hidden;
+  transition: border-color .15s, box-shadow .15s, transform .15s;
+}
+.mkcard:hover { border-color: #B7EBD0; box-shadow: 0 8px 20px -10px rgba(15,23,42,.25); transform: translateY(-1px); }
+.mkbody { display: flex; align-items: center; gap: 10px; padding: 11px 12px; flex: 1; min-width: 0; text-decoration: none; }
+.mkava {
+  width: 34px; height: 34px; border-radius: 10px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 15px; font-weight: 700;
+  box-shadow: 0 3px 8px -3px rgba(15,23,42,.45);
+}
+.mkinfo { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mkname { font-size: 13px; font-weight: 600; color: #0F172A; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: color .12s; }
+.mkhost { font-style: normal; font-size: 11.5px; color: #94A3B8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mkcard:hover .mkname { color: #07C160; }
+.panel .mkdel {
+  position: absolute; top: 6px; right: 6px; width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 999px; background: rgba(15,23,42,.06); color: #64748B;
+  font-size: 11px; line-height: 1; cursor: pointer; opacity: 0;
+  transition: opacity .12s, background .12s, color .12s;
+}
+.mkcard:hover .mkdel { opacity: 1; }
+.panel .mkdel:hover { background: #FEE2E2; color: #DC2626; }
+
+/* 空态 */
+.mkempty { border: 1.5px dashed #DCE3EC; border-radius: 14px; padding: 34px 20px; text-align: center; background: #FCFDFE; }
+.mkempty-ico { font-size: 26px; margin-bottom: 8px; }
+.mkempty b { display: block; font-size: 13.5px; color: #0F172A; margin-bottom: 4px; }
+.mkempty p { margin: 0; font-size: 12.5px; color: #94A3B8; }
+.mkempty-tip { font-size: 12.5px; color: #94A3B8; padding: 22px 4px; }
 .empty2 { font-size: 12px; color: #94A3B8; margin: 0 20px; }
 /* 设置页 */
 .sect { font-size: 14px; font-weight: 600; color: #0F172A; margin: 18px 0 4px; border-top: 1px solid #E2E8F0; padding-top: 14px; }
@@ -1235,17 +1604,52 @@ form .ok:hover, .cfgform .ok:hover { background: #06AD56; }
 .kwtag.on { background: #07C160; color: #fff; }
 /* ===== 左侧菜单布局（v0.9.9）===== */
 .shell { display: flex; flex-direction: row; padding: 0; gap: 0; min-height: 100%; }
-.sidenav { width: 150px; flex-shrink: 0; background: #fff; border-right: 1px solid #e3e6ec; display: flex; flex-direction: column; padding: 12px 8px; }
-.sidehead { display: flex; flex-direction: column; gap: 8px; padding: 0 6px 12px; border-bottom: 1px solid #f0f1f4; margin-bottom: 8px; }
-.sidehead b { font-size: 14px; }
-.sideitem { text-align: left; padding: 8px 12px; border: none; background: transparent; border-radius: 8px; font-size: 13px; cursor: pointer; color: #334155; }
-.sideitem:hover { background: #f0faf4; }
-.sideitem.on { background: #07C160; color: #fff; font-weight: 600; }
-.sidesub { text-align: left; padding: 6px 12px 6px 26px; border: none; background: transparent; font-size: 12px; cursor: pointer; color: #64748B; border-radius: 8px; }
-.sidesub:hover { background: #f0faf4; color: #07C160; }
-.sidesub.on { color: #07C160; font-weight: 600; background: #e8f9ef; }
-.sidefoot { margin-top: auto; border-top: 1px solid #f0f1f4; padding-top: 8px; }
+.sidenav {
+  width: 184px; flex-shrink: 0; display: flex; flex-direction: column;
+  background: linear-gradient(180deg, #FFFFFF 0%, #F6FAF7 100%);
+  border-right: 1px solid #E7ECF1; padding: 14px 10px 12px;
+}
+.sidehead { display: flex; flex-direction: column; gap: 10px; padding: 0 4px 12px; border-bottom: 1px solid #EDF1F5; margin-bottom: 10px; }
+.brand { display: flex; align-items: center; gap: 9px; padding: 2px 4px; }
+.brand-ico {
+  width: 32px; height: 32px; border-radius: 10px; flex: none;
+  display: flex; align-items: center; justify-content: center; font-size: 16px;
+  background: linear-gradient(135deg, #10D269, #07A94F);
+  box-shadow: 0 3px 8px -3px rgba(7,193,96,.5);
+}
+.brand-txt { display: flex; flex-direction: column; min-width: 0; }
+.brand-txt b { font-size: 13.5px; color: #0F172A; line-height: 1.25; }
+.brand-txt em { font-style: normal; font-size: 10px; color: #94A3B8; letter-spacing: .2px; }
+.sideitem {
+  text-align: left; padding: 9px 12px; border: none; background: transparent;
+  border-radius: 9px; font-size: 13px; cursor: pointer; color: #334155;
+  display: flex; align-items: center; gap: 8px;
+  transition: background .12s, color .12s;
+}
+.sideitem:hover { background: #EEF5F0; color: #0F172A; }
+.sideitem.on { background: #E8F9EF; color: #079B52; font-weight: 600; box-shadow: inset 3px 0 0 #07C160; }
+.sideitem.back { color: #64748B; font-size: 12.5px; }
+.sidesub {
+  text-align: left; padding: 7px 12px 7px 34px; border: none; background: transparent;
+  font-size: 12px; cursor: pointer; color: #64748B; border-radius: 9px;
+  transition: background .12s, color .12s; position: relative;
+}
+.sidesub::before {
+  content: ""; position: absolute; left: 22px; top: 50%; transform: translateY(-50%);
+  width: 4px; height: 4px; border-radius: 99px; background: #CBD5E1;
+}
+.sidesub:hover { background: #EEF5F0; color: #0F172A; }
+.sidesub.on { color: #079B52; font-weight: 600; background: #E8F9EF; }
+.sidesub.on::before { background: #07C160; }
+.sidefoot { margin-top: auto; border-top: 1px solid #EDF1F5; padding-top: 8px; }
 .sidecontent { flex: 1; min-width: 0; padding: 14px 16px; overflow-y: auto; }
+/* 细滚动条 */
+.sidecontent::-webkit-scrollbar, .panel::-webkit-scrollbar { width: 9px; }
+.sidecontent::-webkit-scrollbar-thumb, .panel::-webkit-scrollbar-thumb {
+  background: #D5DCE4; border-radius: 99px; border: 2.5px solid transparent; background-clip: content-box;
+}
+.sidecontent::-webkit-scrollbar-thumb:hover, .panel::-webkit-scrollbar-thumb:hover { background-color: #C2CBD6; }
+.sidecontent::-webkit-scrollbar-track, .panel::-webkit-scrollbar-track { background: transparent; }
 /* wx 采集进度/消息（v0.9.11）*/
 .wxprog { height: 5px; background: #eef0f4; border-radius: 99px; overflow: hidden; margin: 6px 0; }
 .wxprog-in { height: 100%; background: #07C160; border-radius: 99px; transition: width .25s; }
@@ -1255,4 +1659,43 @@ form .ok:hover, .cfgform .ok:hover { background: #06AD56; }
 .wxmsg.err { color: #e5484d; }
 .wxmsg.ok { color: #07C160; }
 .wxmsg.busy { color: #3b82f6; }
+
+/* ===== 全局美化补丁（v0.9.11）===== */
+/* 分块卡片：圆角 + 轻阴影 */
+.cardblock { border-radius: 12px; padding: 14px 16px; box-shadow: 0 1px 2px rgba(15,23,42,.04); }
+/* 分节标题里的按钮靠右 */
+.bmtitle .mini { margin-left: auto; }
+/* 筛选胶囊：文字不折行，整组换行 */
+.fgroup button { white-space: nowrap; padding: 4px 9px; font-size: 12px; }
+.fgroup { flex: none; max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.fgroup::-webkit-scrollbar { display: none; }
+.fgroups { align-items: flex-start; }
+/* 统计条更紧凑，少一行留白 */
+.statrow { gap: 5px; }
+.statrow span { padding: 2px 7px; }
+.statrow-actions { gap: 6px; }
+.statrow-actions .mini { padding: 5px 11px; }
+/* 主按钮（引用创作「生成草稿」等，原先没有样式） */
+.panel .primary {
+  display: block; width: 100%; margin-top: 10px;
+  padding: 9px 16px; border: 0; border-radius: 9px;
+  background: #07C160; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: background .12s, transform .08s;
+}
+.panel .primary:hover:not(:disabled) { background: #06AD56; }
+.panel .primary:active:not(:disabled) { transform: translateY(1px); }
+.panel .primary:disabled { opacity: .45; cursor: default; }
+/* 文本域统一观感 */
+.panel textarea {
+  display: block; width: 100%; box-sizing: border-box;
+  padding: 8px 12px; border: 1px solid #E2E8F0; border-radius: 8px;
+  font-size: 13px; color: #0F172A; background: #FFFFFF; outline: none;
+  font-family: inherit; line-height: 1.5; resize: vertical;
+  transition: border-color .12s, box-shadow .12s;
+}
+.panel textarea:focus { border-color: #07C160; box-shadow: 0 0 0 3px rgba(7,193,96,.12); }
+.panel textarea::placeholder { color: #A8B3C4; }
+/* 白色按钮加一点点立体感 */
+.panel button:not(.sideitem):not(.sidesub):not(.sidefoot button) { box-shadow: 0 1px 2px rgba(15,23,42,.05); }
+.panel button:not(.sideitem):not(.sidesub):not(.sidefoot button):active { transform: translateY(1px); box-shadow: none; }
 </style>

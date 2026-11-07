@@ -52,15 +52,19 @@ pub async fn feishu_push_daily(state: State<'_, PetState>) -> Result<String, Str
     if wh.trim().is_empty() { return Err("未配置飞书 webhook".into()); }
     // 复用每日冒泡逻辑
     let review = crate::daily_review_inner(&kb)?;
-    let mut text = format!("🐱 每日冒泡 {}\n\n📌 今日知识卡：《{}》\n", 
-        crate::chrono_today(), review.title);
-    text.push_str(&format!("💡 {}\n", review.conclusion));
-    if !review.todos.is_empty() {
-        text.push_str("\n✅ 待办：\n");
-        for t in review.todos.iter().take(5) { text.push_str(&format!("· {t}\n")); }
+    let cfg2 = state.config.lock().unwrap().clone();
+    let todos_str = if review.todos.is_empty() { "（今日知识卡没有待办）".to_string() }
+        else { review.todos.iter().take(5).map(|t| format!("· {t}")).collect::<Vec<_>>().join("\n") };
+    let text = if cfg2.prompt_daily.trim().is_empty() {
+        format!("🐱 每日冒泡 {}\n\n📌 今日知识卡：《{}》\n💡 {}\n\n✅ 待办：\n{}",
+            crate::chrono_today(), review.title, review.conclusion, todos_str)
     } else {
-        text.push_str("\n（今日知识卡没有待办）");
-    }
+        cfg2.prompt_daily
+            .replace("{date}", &crate::chrono_today())
+            .replace("{title}", &review.title)
+            .replace("{conclusion}", &review.conclusion)
+            .replace("{todos}", &todos_str)
+    };
     feishu_send_text(wh.trim(), &text).await
 }
 
@@ -197,10 +201,14 @@ pub async fn notion_sync_to_cards(state: State<'_, PetState>, limit: u32) -> Res
         let text = notion_page_text(&client, &page_id).await.unwrap_or_default();
         if text.trim().is_empty() { continue; }
         let url = r["url"].as_str().unwrap_or("");
-        let prompt = format!(
-            "你是知识库管理员。把下面的素材整理成一张知识卡。\n输出 frontmatter + 正文，格式严格如下（YAML）:\n---\ntitle: 卡片标题（10字内）\ntags: [标签1, 标签2]\nstatus: seed\nsource: \"Notion: {}\"\n---\n\n# 一句话结论\n\n（最核心的判断一句话）\n\n## 展开\n\n（要点、例子，markdown 列表，300字内）\n\n## 下一步行动\n\n- [ ] 一个可执行的下一步\n\n素材标题：{}\n素材内容：\n{}",
-            url, title, text
-        );
+        let prompt = if cfg.prompt_article.trim().is_empty() {
+            format!(
+                "你是知识库管理员。把下面的素材整理成一张知识卡。\n输出 frontmatter + 正文，格式严格如下（YAML）:\n---\ntitle: 卡片标题（10字内）\ntags: [标签1, 标签2]\nstatus: seed\nsource: \"Notion: {}\"\n---\n\n# 一句话结论\n\n（最核心的判断一句话）\n\n## 展开\n\n（要点、例子，markdown 列表，300字内）\n\n## 下一步行动\n\n- [ ] 一个可执行的下一步\n\n素材标题：{}\n素材内容：\n{}",
+                url, title, text
+            )
+        } else {
+            cfg.prompt_article.replace("{url}", url).replace("{content}", &text)
+        };
         let content = crate::ai_chat(&cfg, &prompt).await?;
         let body = match content.find("\n---\n").or_else(|| content.starts_with("---").then(|| 0)) {
             Some(p) => &content[p.max(0)..],

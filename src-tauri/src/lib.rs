@@ -325,11 +325,25 @@ async fn process_queue(state: State<'_, PetState>) -> Result<String, String> {
     // 断点续传：pop 后立即落盘剩余队列
     save_queue(&state);
     eprintln!("[pet] process_queue pop id={}", id);
+    fetch_by_id(&state, &id).await
+}
+
+/// 按条目抓取（收件箱多选 → 批量抓正文用）：先从队列里摘掉这条，避免之后重复抓
+#[tauri::command]
+async fn fetch_item(state: State<'_, PetState>, id: String) -> Result<String, String> {
+    // 队列里存的是短 id（kp+毫秒），前端传的是完整条目 id（kp…-网页剪藏）
+    state.queue.lock().unwrap().retain(|x| !id.starts_with(x.as_str()));
+    save_queue(&state);
+    fetch_by_id(&state, &id).await
+}
+
+/// 抓正文主体（原 process_queue 逻辑）
+async fn fetch_by_id(state: &State<'_, PetState>, id: &str) -> Result<String, String> {
     let kb = state.kb_dir.lock().unwrap().clone();
     let cfg = state.config.lock().unwrap().clone();
     let items = scan_items(&kb);
     eprintln!("[pet] items: {:?}", items.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
-    let it = items.iter().find(|i| i.id == id || i.id.starts_with(&id)).ok_or(format!("条目不存在：{}", id))?;
+    let it = items.iter().find(|i| i.id.as_str() == id || i.id.starts_with(id)).ok_or(format!("条目不存在：{}", id))?;
     let url = it.url.clone();
     let path = kb.join(&it.file);
     eprintln!("[pet] fetching url={:?} path={:?}", url, path);
@@ -708,7 +722,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(PetState { kb_dir: Mutex::new(kb.clone()), config: Mutex::new(cfg), queue: Mutex::new(load_queue(&kb)) })
         .invoke_handler(tauri::generate_handler![
-            list_items, capture, process_queue, capture_text_urls, ai_make_card, mark_read, delete_item, fetch_models,
+            list_items, capture, process_queue, fetch_item, capture_text_urls, ai_make_card, mark_read, delete_item, fetch_models,
             get_config, set_config, move_kb_dir, list_bookmarks, add_bookmark, remove_bookmark,
             stats, bubble, open_kb, read_clipboard_text,
             list_cards, quote_create, list_drafts, gen_topics, daily_review,
